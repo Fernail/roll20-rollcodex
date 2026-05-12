@@ -10,7 +10,7 @@
 ## Points a fournir dans le Web Store
 
 - Nom : `RollCodex Roll20`
-- Description courte : `Connecte une table Roll20 a RollCodex sans API Script Roll20.`
+- Description courte : `Connecte une table Roll20 a RollCodex.`
 - Justification des permissions :
   - `storage` : conserver la liaison locale et l'etat d'auto-capture.
   - `tabs` : retrouver l'onglet Roll20 ouvert pendant le jumelage.

@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "RollCodex Roll20",
   "version": "0.3.0",
-  "description": "Extension Roll20 pour connecter une table a RollCodex sans API Script Roll20.",
+  "description": "Extension Roll20 pour connecter une table a RollCodex.",
   "permissions": ["storage", "tabs"],
   "host_permissions": [
     "http://localhost:5173/*",

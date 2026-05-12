@@ -361,7 +361,7 @@
     const liveTotals = liveSummary.totals || createEmptyLiveMetricTotals();
     const topSpeaker = liveSummary.top_participants?.[0]?.speaker || 'Table Roll20';
     const status = state.status || (connection ? 'Connecte' : 'Non connecte');
-    const target = connection ? `${connection.campaign_label || 'Campagne'} / ${connection.table_label || 'Table'}` : 'Extension seule, sans API Script Roll20';
+    const target = connection ? `${connection.campaign_label || 'Campagne'} / ${connection.table_label || 'Table'}` : 'Extension prete a connecter';
     panel.innerHTML = `
       <div style="font-weight:700;margin-bottom:4px">RollCodex</div>
       <div style="margin-bottom:6px;color:#e9bfd0">${escapeHtml(target)}</div>
@@ -542,7 +542,7 @@
       source: 'roll20-dom-extension',
       speakers: Array.from(speakers.entries()).map(([speaker, count]) => ({ speaker, count })).slice(0, 64),
       action_hints: Array.from(actionHints.entries()).map(([action_type, count]) => ({ action_type, count })),
-      limits: ['roll20_dom_only', 'no_actor_item_api'],
+      limits: ['roll20_dom_only', 'visible_text_mapping_only'],
     };
   }
 
