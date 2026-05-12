@@ -1,0 +1,40 @@
+{
+  "manifest_version": 3,
+  "name": "RollCodex Roll20",
+  "version": "0.3.0",
+  "description": "Extension Roll20 pour connecter une table a RollCodex sans API Script Roll20.",
+  "permissions": ["storage", "tabs"],
+  "host_permissions": [
+    "http://localhost:5173/*",
+    "http://localhost/*",
+    "http://127.0.0.1/*",
+    "http://localtest.me:5173/*",
+    "https://rollcodex.app/*",
+    "https://rollledger.vercel.app/*",
+    "https://*.supabase.co/*",
+    "https://app.roll20.net/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "http://localhost:5173/*",
+        "http://localtest.me:5173/*",
+        "https://rollcodex.app/*",
+        "https://rollledger.vercel.app/*"
+      ],
+      "js": ["rollcodex-content.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["https://app.roll20.net/*"],
+      "js": ["roll20-content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_title": "RollCodex Roll20"
+  }
+}
