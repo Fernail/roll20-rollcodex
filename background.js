@@ -2,9 +2,10 @@
   const MESSAGE_CONFIRM = 'ROLLCODEX_ROLL20_CONFIRM';
   const MESSAGE_SEND_CHAT_COMMAND = 'ROLLCODEX_ROLL20_SEND_CHAT_COMMAND';
   const MESSAGE_SEND_SNAPSHOT = 'ROLLCODEX_ROLL20_SEND_SNAPSHOT';
+  const MESSAGE_FETCH_MAPPING_PROFILE = 'ROLLCODEX_ROLL20_FETCH_MAPPING_PROFILE';
   const MESSAGE_EXTENSION_CONNECTED = 'ROLLCODEX_ROLL20_EXTENSION_CONNECTED';
   const CONFIRM_PREFIX = '!rollcodex confirm ';
-  const BRIDGE_CLIENT = 'roll20-extension/0.3.1';
+  const BRIDGE_CLIENT = 'roll20-extension/0.3.2';
   const PENDING_PAIRING_KEY = 'rollcodexExtensionPendingPairing';
   const CONNECTION_KEY = 'rollcodexExtensionConnection';
 
@@ -102,6 +103,20 @@
     }
   }
 
+  function isAllowedMappingProfileEndpoint(endpoint) {
+    try {
+      const url = new URL(String(endpoint || ''));
+      const host = url.hostname.toLowerCase();
+      const isLocal = host === 'localhost' || host === '127.0.0.1';
+      const isSupabase = host.endsWith('.supabase.co');
+      return ['http:', 'https:'].includes(url.protocol)
+        && (isLocal || isSupabase)
+        && url.pathname.includes('/functions/v1/vtt-mapping-profile');
+    } catch (_error) {
+      return false;
+    }
+  }
+
   function isAllowedSnapshotRequest(request) {
     const payload = request?.payload;
     return request?.type === 'rollcodex:roll20-bridge-snapshot'
@@ -113,6 +128,15 @@
       && typeof payload.connection_id === 'string'
       && typeof payload.connection_secret === 'string'
       && Array.isArray(payload.messages);
+  }
+
+  function isAllowedMappingProfileRequest(request) {
+    const payload = request?.payload;
+    return request?.type === 'rollcodex:roll20-bridge-mapping-profile'
+      && isAllowedMappingProfileEndpoint(request.endpoint)
+      && payload?.provider === 'roll20'
+      && typeof payload.connection_id === 'string'
+      && typeof payload.connection_secret === 'string';
   }
 
   function sendConfirmationToRoll20(command, sendResponse) {
@@ -186,6 +210,33 @@
     }
   }
 
+  async function fetchMappingProfileFromRollCodex(request, sendResponse) {
+    if (!isAllowedMappingProfileRequest(request)) {
+      sendResponse({ ok: false, error: 'Profil de mapping refuse par le bridge.' });
+      return;
+    }
+
+    try {
+      const response = await fetch(request.endpoint, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'text/plain;charset=UTF-8',
+          'X-RollCodex-Client': BRIDGE_CLIENT,
+        },
+        body: JSON.stringify(request.payload),
+      });
+      const text = await response.text();
+      const payload = parseJsonText(text);
+      if (!response.ok) {
+        sendResponse({ ok: false, error: payload?.message || payload?.error || 'Profil RollCodex refuse.' });
+        return;
+      }
+      sendResponse({ ok: true, payload });
+    } catch (error) {
+      sendResponse({ ok: false, error: error?.message || 'Profil RollCodex inaccessible.' });
+    }
+  }
+
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     if (message?.type === MESSAGE_CONFIRM) {
       sendConfirmationToRoll20(message.command, sendResponse);
@@ -193,6 +244,10 @@
     }
     if (message?.type === MESSAGE_SEND_SNAPSHOT) {
       sendSnapshotToRollCodex(message.request, sendResponse);
+      return true;
+    }
+    if (message?.type === MESSAGE_FETCH_MAPPING_PROFILE) {
+      fetchMappingProfileFromRollCodex(message.request, sendResponse);
       return true;
     }
     return false;

@@ -16,7 +16,7 @@ RollCodex aide les MJ a transformer des donnees VTT relues en activite de campag
 
 - Navigateur verifie : Chrome desktop.
 - Roll20 : table ouverte dans `https://app.roll20.net/`.
-- Extension RollCodex Roll20 : 0.3.1.
+- Extension RollCodex Roll20 : 0.3.2.
 
 ## Utilisation
 
