@@ -6,14 +6,16 @@
   const BRIDGE_COMMAND_PREFIX = '!rollcodex bridge ';
   const BRIDGE_SNAPSHOT_MARKER = 'ROLLCODEX_BRIDGE_SNAPSHOT:';
   const BRIDGE_SNAPSHOT_TYPE = 'rollcodex:roll20-bridge-snapshot';
-  const BRIDGE_VERSION = '0.3.0';
+  const BRIDGE_VERSION = '0.3.1';
   const ROLLCODEX_APP_BASE_URL = 'http://localhost:5173';
   const ROLLCODEX_CONNECT_PATH = '/vtt/connect/roll20';
   const PENDING_PAIRING_KEY = 'rollcodexExtensionPendingPairing';
   const CONNECTION_KEY = 'rollcodexExtensionConnection';
   const LAST_SENT_KEY = 'rollcodexExtensionLastSentKey';
   const AUTO_SETTINGS_KEY = 'rollcodexExtensionAutoSettings';
+  const PANEL_SETTINGS_KEY = 'rollcodexExtensionPanelSettings';
   const PANEL_ID = 'rollcodex-extension-panel';
+  const PANEL_POSITIONS = ['bottom-left', 'top-left', 'bottom-right'];
   const MAX_EXTENSION_MESSAGES = 120;
   const LIVE_RECENT_EVENTS_LIMIT = 6;
   const DEFAULT_AUTO_IDLE_MS = 120000;
@@ -215,6 +217,62 @@
     return next;
   }
 
+  function normalizePanelPosition(position) {
+    return PANEL_POSITIONS.includes(position) ? position : PANEL_POSITIONS[0];
+  }
+
+  async function getPanelSettings() {
+    const stored = await getStorageValue(PANEL_SETTINGS_KEY);
+    return {
+      collapsed: stored?.collapsed === true,
+      position: normalizePanelPosition(stored?.position),
+    };
+  }
+
+  async function patchPanelSettings(patch) {
+    const current = await getPanelSettings();
+    const next = {
+      ...current,
+      ...(patch || {}),
+      position: normalizePanelPosition(patch?.position || current.position),
+    };
+    await setStorageValues({ [PANEL_SETTINGS_KEY]: next });
+    return next;
+  }
+
+  function getNextPanelPosition(position) {
+    const currentIndex = PANEL_POSITIONS.indexOf(normalizePanelPosition(position));
+    return PANEL_POSITIONS[(currentIndex + 1) % PANEL_POSITIONS.length];
+  }
+
+  function getPanelPositionStyles(position) {
+    const normalized = normalizePanelPosition(position);
+    if (normalized === 'top-left') return ['left:64px', 'top:76px'];
+    if (normalized === 'bottom-right') return ['right:max(18px, min(340px, calc(100vw - 320px)))', 'bottom:18px'];
+    return ['left:64px', 'bottom:18px'];
+  }
+
+  function getPanelCss(settings) {
+    const collapsed = settings?.collapsed === true;
+    return [
+      'position:fixed',
+      ...getPanelPositionStyles(settings?.position),
+      'z-index:99999',
+      `width:${collapsed ? '208px' : '292px'}`,
+      'max-width:calc(100vw - 92px)',
+      'max-height:min(58vh, 420px)',
+      `padding:${collapsed ? '8px 10px' : '10px'}`,
+      'box-sizing:border-box',
+      'overflow:auto',
+      'border:1px solid #a22d65',
+      'border-radius:8px',
+      'background:rgba(22,16,19,.96)',
+      'color:#f7edf2',
+      'font:12px/1.4 Arial,sans-serif',
+      'box-shadow:0 12px 34px rgba(0,0,0,.38)',
+    ].join(';');
+  }
+
   function bytesToHex(bytes) {
     return Array.from(bytes).map((byte) => byte.toString(16).padStart(2, '0')).join('');
   }
@@ -333,48 +391,70 @@
     return { ok: true };
   }
 
+  async function togglePanelCollapsed() {
+    const settings = await getPanelSettings();
+    await patchPanelSettings({ collapsed: !settings.collapsed });
+    refreshPanel(settings.collapsed ? 'Panneau ouvert' : 'Panneau reduit');
+  }
+
+  async function cyclePanelPosition() {
+    const settings = await getPanelSettings();
+    await patchPanelSettings({ position: getNextPanelPosition(settings.position) });
+    refreshPanel('Panneau deplace');
+  }
+
   function renderPanel(state = {}) {
     let panel = document.getElementById(PANEL_ID);
     if (!panel) {
       panel = document.createElement('div');
       panel.id = PANEL_ID;
-      panel.style.cssText = [
-        'position:fixed',
-        'left:12px',
-        'bottom:12px',
-        'z-index:99999',
-        'width:260px',
-        'padding:10px',
-        'border:1px solid #a22d65',
-        'border-radius:6px',
-        'background:#161013',
-        'color:#f7edf2',
-        'font:12px/1.4 Arial,sans-serif',
-        'box-shadow:0 10px 30px rgba(0,0,0,.35)',
-      ].join(';');
       document.body.appendChild(panel);
     }
 
     const connection = state.connection || null;
     const autoSettings = state.autoSettings || { enabled: true };
+    const panelSettings = state.panelSettings || { collapsed: false, position: PANEL_POSITIONS[0] };
     const liveSummary = state.liveSummary || { totals: createEmptyLiveMetricTotals(), top_participants: [] };
     const liveTotals = liveSummary.totals || createEmptyLiveMetricTotals();
     const topSpeaker = liveSummary.top_participants?.[0]?.speaker || 'Table Roll20';
     const status = state.status || (connection ? 'Connecte' : 'Non connecte');
     const target = connection ? `${connection.campaign_label || 'Campagne'} / ${connection.table_label || 'Table'}` : 'Extension prete a connecter';
+    panel.style.cssText = getPanelCss(panelSettings);
+
+    if (panelSettings.collapsed) {
+      panel.innerHTML = `
+        <div style="display:flex;align-items:center;gap:8px">
+          <span style="display:block;width:8px;height:8px;border-radius:999px;background:${connection ? '#71d493' : '#d9a72a'};box-shadow:0 0 0 3px rgba(255,255,255,.08)"></span>
+          <div style="min-width:0;flex:1">
+            <div style="font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">RollCodex</div>
+            <div style="color:#b9a5ae;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${escapeHtml(status)}</div>
+          </div>
+          <button type="button" data-rollcodex-toggle-panel title="Ouvrir" style="cursor:pointer;background:#d92a78;color:white;border:0;border-radius:4px;min-height:26px;padding:4px 7px">Ouvrir</button>
+        </div>
+      `;
+      panel.querySelector('[data-rollcodex-toggle-panel]')?.addEventListener('click', togglePanelCollapsed);
+      return;
+    }
+
     panel.innerHTML = `
-      <div style="font-weight:700;margin-bottom:4px">RollCodex</div>
+      <div style="display:flex;align-items:center;gap:6px;margin-bottom:6px">
+        <div style="font-weight:700;min-width:0;flex:1">RollCodex</div>
+        <button type="button" data-rollcodex-move-panel title="Deplacer" style="cursor:pointer;background:#2a2228;color:#f7edf2;border:1px solid rgba(255,255,255,.14);border-radius:4px;min-height:26px;padding:4px 7px">Placer</button>
+        <button type="button" data-rollcodex-toggle-panel title="Reduire" style="cursor:pointer;background:#2a2228;color:#f7edf2;border:1px solid rgba(255,255,255,.14);border-radius:4px;min-height:26px;padding:4px 7px">Reduire</button>
+      </div>
       <div style="margin-bottom:6px;color:#e9bfd0">${escapeHtml(target)}</div>
       <div style="margin-bottom:4px;color:#d7c1ca">Live: ${liveTotals.messages} msg - ${liveTotals.rolls} jets - ${liveTotals.criticals} crit - ${liveTotals.damage} degats - ${liveTotals.healing} soins</div>
       <div style="margin-bottom:6px;color:#b9a5ae">Actif: ${escapeHtml(topSpeaker)}</div>
       <div data-rollcodex-status style="margin-bottom:8px;color:#c8f0d0">${escapeHtml(status)}</div>
       <div style="display:flex;gap:6px;flex-wrap:wrap">
-        <button type="button" data-rollcodex-connect style="cursor:pointer;background:#d92a78;color:white;border:0;border-radius:4px;padding:5px 7px">Connecter</button>
-        <button type="button" data-rollcodex-send style="cursor:pointer;background:#335f9f;color:white;border:0;border-radius:4px;padding:5px 7px" ${connection ? '' : 'disabled'}>Envoyer</button>
-        <button type="button" data-rollcodex-auto style="cursor:pointer;background:${autoSettings.enabled ? '#236347' : '#5c4230'};color:white;border:0;border-radius:4px;padding:5px 7px">Auto ${autoSettings.enabled ? 'ON' : 'OFF'}</button>
-        <button type="button" data-rollcodex-forget style="cursor:pointer;background:#3a2d34;color:white;border:0;border-radius:4px;padding:5px 7px">Oublier</button>
+        <button type="button" data-rollcodex-connect style="cursor:pointer;background:#d92a78;color:white;border:0;border-radius:4px;min-height:28px;padding:5px 8px">Connecter</button>
+        <button type="button" data-rollcodex-send style="cursor:pointer;background:#335f9f;color:white;border:0;border-radius:4px;min-height:28px;padding:5px 8px" ${connection ? '' : 'disabled'}>Envoyer</button>
+        <button type="button" data-rollcodex-auto style="cursor:pointer;background:${autoSettings.enabled ? '#236347' : '#5c4230'};color:white;border:0;border-radius:4px;min-height:28px;padding:5px 8px">Auto ${autoSettings.enabled ? 'ON' : 'OFF'}</button>
+        <button type="button" data-rollcodex-forget style="cursor:pointer;background:#3a2d34;color:white;border:0;border-radius:4px;min-height:28px;padding:5px 8px">Oublier</button>
       </div>
     `;
+    panel.querySelector('[data-rollcodex-move-panel]')?.addEventListener('click', cyclePanelPosition);
+    panel.querySelector('[data-rollcodex-toggle-panel]')?.addEventListener('click', togglePanelCollapsed);
     panel.querySelector('[data-rollcodex-connect]')?.addEventListener('click', startExtensionPairing);
     panel.querySelector('[data-rollcodex-send]')?.addEventListener('click', sendExtensionSnapshot);
     panel.querySelector('[data-rollcodex-auto]')?.addEventListener('click', toggleAutoCapture);
@@ -389,9 +469,10 @@
   async function refreshPanel(status = '') {
     const connection = await getStorageValue(CONNECTION_KEY);
     const autoSettings = await getAutoSettings();
+    const panelSettings = await getPanelSettings();
     const visibleMessages = getChatRows().map(normalizeChatRow).filter(Boolean);
     recordLiveMetricsFromMessages(visibleMessages);
-    renderPanel({ connection, autoSettings, liveSummary: summarizeLiveMetrics(), status: status || (connection ? 'Connecte via extension' : 'Pret pour jumelage') });
+    renderPanel({ connection, autoSettings, panelSettings, liveSummary: summarizeLiveMetrics(), status: status || (connection ? 'Connecte via extension' : 'Pret pour jumelage') });
   }
 
   async function toggleAutoCapture() {
