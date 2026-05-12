@@ -43,7 +43,7 @@ L'extension envoie des captures VTT a relire. RollCodex ne transforme pas automa
 - La capture s'appuie sur les messages visibles/lisibles dans le DOM Roll20.
 - Les changements d'interface Roll20 peuvent necessiter une adaptation des selecteurs.
 - Roll20 ne fournit pas a l'extension les objets Actor/Item natifs de Foundry. Le mapping reste donc base sur les speakers et textes visibles.
-- La publication Chrome Web Store reste a finaliser.
+- Le paquet Chrome Web Store se genere avec `scripts/package-extension.ps1 -Channel store`.
 
 ## Support
 
