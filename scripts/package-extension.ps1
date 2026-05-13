@@ -15,19 +15,23 @@ $zipName = "rollcodex-roll20-v$version-$channelName.zip"
 $outputPath = Join-Path $root $OutputDirectory
 $zipPath = Join-Path $outputPath $zipName
 $stagingPath = Join-Path $outputPath "package-$channelName"
+$unpackedPath = Join-Path $outputPath "unpacked-$channelName"
+$otherChannelName = if ($channelName -eq "store") { "dev" } else { "store" }
+$otherUnpackedPath = Join-Path $outputPath "unpacked-$otherChannelName"
 $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 
 New-Item -ItemType Directory -Force -Path $outputPath | Out-Null
 if (Test-Path $zipPath) { Remove-Item -Force $zipPath }
 if (Test-Path $stagingPath) { Remove-Item -Recurse -Force $stagingPath }
+if (Test-Path $unpackedPath) { Remove-Item -Recurse -Force $unpackedPath }
+if (Test-Path $otherUnpackedPath) { Remove-Item -Recurse -Force $otherUnpackedPath }
 New-Item -ItemType Directory -Force -Path $stagingPath | Out-Null
 
 $files = @(
   "manifest.json",
   "background.js",
   "roll20-content.js",
-  "rollcodex-content.js",
-  "README.md"
+  "rollcodex-content.js"
 )
 
 $directories = @(
@@ -92,9 +96,13 @@ if ($channelName -eq "store") {
 
 $packageEntries = Get-ChildItem -Force -Path $stagingPath | ForEach-Object { $_.FullName }
 Compress-Archive -Path $packageEntries -DestinationPath $zipPath
+Copy-Item -Recurse -Path $stagingPath -Destination $unpackedPath
 Remove-Item -Recurse -Force $stagingPath
 
 Write-Host "Package Chrome $channelName pret: $zipPath"
+Write-Host "Extension non empaquetee $channelName prete: $unpackedPath"
 if ($channelName -eq "store") {
   Write-Host "Canal store: rollcodex.app, app.roll20.net et Supabase uniquement."
+} else {
+  Write-Host "Canal dev: localhost, localtest.me, app.roll20.net et Supabase."
 }

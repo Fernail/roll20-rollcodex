@@ -16,12 +16,17 @@
   const MAPPING_PROFILE_KEY = 'rollcodexExtensionMappingProfile';
   const AUTO_SETTINGS_KEY = 'rollcodexExtensionAutoSettings';
   const PANEL_SETTINGS_KEY = 'rollcodexExtensionPanelSettings';
+  const KIKIMETER_SETTINGS_KEY = 'rollcodexExtensionKikimeterSettings';
   const PANEL_ID = 'rollcodex-extension-panel';
   const PANEL_POSITIONS = ['bottom-left', 'top-left', 'bottom-right', 'manual'];
   const MAX_EXTENSION_MESSAGES = 120;
   const LIVE_RECENT_EVENTS_LIMIT = 6;
   const DEFAULT_AUTO_IDLE_MS = 45 * 60000;
   const DEFAULT_AUTO_MIN_INTERVAL_MS = 120000;
+  const MAPPING_PROFILE_TTL_MS = 30000;
+  const LIVE_ROLL_EVENT_TYPES = new Set(['roll', 'attack', 'spell_attack', 'saving_throw', 'initiative', 'skill_check']);
+  const LIVE_DAMAGE_EVENT_TYPES = new Set(['damage', 'spell_damage']);
+  const LIVE_HEALING_EVENT_TYPES = new Set(['healing', 'heal']);
   const processedBridgeSnapshots = new Set();
   let autoCaptureTimer = null;
   let autoCaptureObserver = null;
@@ -30,6 +35,7 @@
 
   const liveMetricsState = {
     messageKeys: new Set(),
+    messages: [],
     participants: new Map(),
     recentEvents: [],
     totals: createEmptyLiveMetricTotals(),
@@ -91,6 +97,7 @@
 
   function resetLiveMetricsState() {
     liveMetricsState.messageKeys = new Set();
+    liveMetricsState.messages = [];
     liveMetricsState.participants = new Map();
     liveMetricsState.recentEvents = [];
     liveMetricsState.totals = createEmptyLiveMetricTotals();
@@ -295,6 +302,24 @@
     return next;
   }
 
+  function normalizeKikimeterMetricId(metricId) {
+    const normalized = normalizeText(metricId);
+    return normalized || '';
+  }
+
+  async function getKikimeterSettings() {
+    const stored = await getStorageValue(KIKIMETER_SETTINGS_KEY);
+    return {
+      metric_id: normalizeKikimeterMetricId(stored?.metric_id || stored?.metric),
+    };
+  }
+
+  async function setKikimeterMetric(metricId) {
+    const nextMetricId = normalizeKikimeterMetricId(metricId);
+    await setStorageValues({ [KIKIMETER_SETTINGS_KEY]: { metric_id: nextMetricId } });
+    refreshPanel(nextMetricId ? 'Kikimeter mis a jour' : 'Kikimeter sans mesure');
+  }
+
   function getNextPanelPosition(position) {
     const currentIndex = PANEL_POSITIONS.indexOf(normalizePanelPosition(position));
     const cycle = PANEL_POSITIONS.filter((item) => item !== 'manual');
@@ -369,6 +394,279 @@
 
   function isPlaceholderGameTitle(value) {
     return /^(roll20|loading|chargement|campagne|campaign)$/i.test(normalizeText(value));
+  }
+
+  function isPlaceholderConnectionLabel(value) {
+    const normalized = normalizeText(value).replace(/[.\u2026]+$/g, '');
+    return /^(roll20\s*[-:/]\s*)?(loading|chargement|campagne|campaign|table)(\s*[-:/]\s*roll20)?$/i.test(normalized)
+      || /^(roll20|campagne|campaign|table)$/i.test(normalized);
+  }
+
+  function getConnectionDisplayLabel(value) {
+    const label = normalizeText(value);
+    return label && !isPlaceholderConnectionLabel(label) ? label : '';
+  }
+
+  function getConnectionTargetRows(connection) {
+    const campaignLabel = getConnectionDisplayLabel(connection?.campaign_label);
+    const tableLabel = getConnectionDisplayLabel(connection?.table_label);
+
+    if (campaignLabel || tableLabel) {
+      return [
+        campaignLabel ? { label: 'Campagne', value: campaignLabel } : null,
+        tableLabel ? { label: 'Table', value: tableLabel } : null,
+      ].filter(Boolean);
+    }
+
+    const gameTitle = getRoll20GameTitle();
+    return [{ label: 'Table', value: gameTitle && gameTitle !== 'Roll20' ? gameTitle : 'Table Roll20' }];
+  }
+
+  function renderConnectionTarget(connection) {
+    return getConnectionTargetRows(connection).map((row) => `
+      <div style="display:flex;gap:5px;min-width:0;line-height:1.35">
+        <span style="color:#b9a5ae;flex:0 0 auto">${escapeHtml(row.label)}:</span>
+        <span style="color:#e9bfd0;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(row.value)}</span>
+      </div>
+    `).join('');
+  }
+
+  function normalizeProfileMetric(metric) {
+    const id = normalizeText(metric?.id || metric?.key || metric?.name);
+    if (!id || metric?.live_supported === false) return null;
+    return {
+      id,
+      label: normalizeText(metric?.name || metric?.label || id),
+      aggregation: normalizeText(metric?.aggregation || 'count').toLowerCase(),
+      field: normalizeText(metric?.field || '').toLowerCase(),
+      percentField: normalizeText(metric?.percent_field || metric?.field || '').toLowerCase(),
+      percentOperator: normalizeText(metric?.percent_operator || 'eq').toLowerCase(),
+      percentValue: metric?.percent_value ?? null,
+      filterEventType: Array.isArray(metric?.filter_event_type)
+        ? metric.filter_event_type.map((item) => normalizeText(item).toLowerCase()).filter(Boolean)
+        : [],
+      sortOrder: Number(metric?.sort_order) || 0,
+    };
+  }
+
+  function getProfileMetrics(profile) {
+    return (Array.isArray(profile?.metrics) ? profile.metrics : [])
+      .map(normalizeProfileMetric)
+      .filter(Boolean)
+      .sort((left, right) => left.sortOrder - right.sortOrder || left.label.localeCompare(right.label));
+  }
+
+  function getSelectedProfileMetric(metrics, selectedMetricId) {
+    const normalizedId = normalizeKikimeterMetricId(selectedMetricId);
+    return metrics.find((metric) => metric.id === normalizedId) || metrics[0] || null;
+  }
+
+  function getMetricProfileStatus(profile, connection) {
+    if (!connection) return 'Connexion RollCodex requise';
+    if (!connection.mapping_profile_endpoint) return 'Profil RollCodex non synchronise';
+    if (!profile?.schema_version) return 'Profil RollCodex indisponible';
+    const metricCount = Array.isArray(profile.metrics) ? profile.metrics.length : 0;
+    if (!metricCount) return 'Aucune mesure dans le registre cible';
+    if (!getProfileMetrics(profile).length) return 'Aucune mesure compatible live dans le registre';
+    return '';
+  }
+
+  function isRollLikeMessage(message) {
+    const actionType = normalizeText(message?.action_type_hint).toLowerCase();
+    return message?.roll_total_hint != null
+      || message?.roll_natural_hint != null
+      || LIVE_ROLL_EVENT_TYPES.has(actionType);
+  }
+
+  function messageMatchesMetricFilter(message, metric) {
+    const filters = metric.filterEventType || [];
+    if (!filters.length) return true;
+    const actionType = normalizeText(message?.action_type_hint || 'message').toLowerCase();
+    return filters.some((filter) => {
+      if (filter === actionType) return true;
+      if (LIVE_DAMAGE_EVENT_TYPES.has(filter)) return message?.damage_total_hint != null || LIVE_DAMAGE_EVENT_TYPES.has(actionType);
+      if (LIVE_HEALING_EVENT_TYPES.has(filter)) return message?.heal_total_hint != null || LIVE_HEALING_EVENT_TYPES.has(actionType);
+      if (LIVE_ROLL_EVENT_TYPES.has(filter)) return isRollLikeMessage(message);
+      return false;
+    });
+  }
+
+  function getMetricFieldValue(message, field) {
+    if (field === 'damage_total') return toSafeNumber(message?.damage_total_hint);
+    if (field === 'heal_total') return toSafeNumber(message?.heal_total_hint);
+    if (field === 'roll_natural') return toSafeNumber(message?.roll_natural_hint);
+    if (field === 'modifier') return null;
+    return toSafeNumber(message?.roll_total_hint);
+  }
+
+  function compareMetricPercent(value, metric) {
+    const expected = toSafeNumber(metric.percentValue);
+    if (value == null || expected == null) return false;
+    if (metric.percentOperator === 'gt') return value > expected;
+    if (metric.percentOperator === 'gte') return value >= expected;
+    if (metric.percentOperator === 'lt') return value < expected;
+    if (metric.percentOperator === 'lte') return value <= expected;
+    if (metric.percentOperator === 'ne') return value !== expected;
+    return value === expected;
+  }
+
+  function resolveSpeakerMapping(profile, speaker) {
+    const sourceKey = normalizeMappingKey(speaker);
+    const mappings = Array.isArray(profile?.mappings) ? profile.mappings : [];
+    return mappings.find((mapping) => mapping?.source_kind === 'speaker' && normalizeMappingKey(mapping.source_key || mapping.source_label) === sourceKey) || null;
+  }
+
+  function getMetricBucket(profile, message) {
+    const speaker = normalizeText(message?.speaker) || 'Roll20';
+    const mapping = resolveSpeakerMapping(profile, speaker);
+    const targetId = normalizeText(mapping?.target_id);
+    const targetKind = normalizeText(mapping?.target_kind);
+    const label = normalizeText(mapping?.target_label) || speaker;
+    return {
+      key: targetId ? `${targetKind || 'target'}:${targetId}` : `speaker:${normalizeMappingKey(speaker)}`,
+      label,
+      sourceLabel: speaker,
+      mapped: Boolean(targetId),
+    };
+  }
+
+  function addMetricContribution(bucket, metric, message) {
+    const aggregation = metric.aggregation || 'count';
+    if (aggregation === 'percent_critical') {
+      if (!isRollLikeMessage(message)) return;
+      bucket.denominator += 1;
+      if (message.roll_natural_hint === 20) bucket.numerator += 1;
+      return;
+    }
+    if (aggregation === 'percent_fumble') {
+      if (!isRollLikeMessage(message)) return;
+      bucket.denominator += 1;
+      if (message.roll_natural_hint === 1) bucket.numerator += 1;
+      return;
+    }
+    if (aggregation === 'percent') {
+      const value = getMetricFieldValue(message, metric.percentField || metric.field);
+      if (value == null) return;
+      bucket.denominator += 1;
+      if (compareMetricPercent(value, metric)) bucket.numerator += 1;
+      return;
+    }
+    if (aggregation === 'avg' || aggregation === 'average' || aggregation === 'mean') {
+      const value = getMetricFieldValue(message, metric.field);
+      if (value == null) return;
+      bucket.sum += value;
+      bucket.count += 1;
+      return;
+    }
+    if (aggregation === 'sum') {
+      const value = getMetricFieldValue(message, metric.field);
+      if (value == null) return;
+      bucket.sum += value;
+      bucket.count += 1;
+      return;
+    }
+    bucket.count += 1;
+  }
+
+  function formatMetricValue(value, metric) {
+    if (['percent', 'percent_critical', 'percent_fumble'].includes(metric?.aggregation)) {
+      return `${Math.round(value * 10) / 10}%`;
+    }
+    if (['avg', 'average', 'mean'].includes(metric?.aggregation)) {
+      return String(Math.round(value * 10) / 10);
+    }
+    return String(Math.round(value));
+  }
+
+  function computeKikimeterLeaderboard(profile, metric) {
+    if (!metric) return [];
+    const buckets = new Map();
+    liveMetricsState.messages.forEach((message) => {
+      if (!messageMatchesMetricFilter(message, metric)) return;
+      const bucketInfo = getMetricBucket(profile, message);
+      const bucket = buckets.get(bucketInfo.key) || {
+        ...bucketInfo,
+        count: 0,
+        sum: 0,
+        numerator: 0,
+        denominator: 0,
+        messages: 0,
+      };
+      bucket.messages += 1;
+      addMetricContribution(bucket, metric, message);
+      buckets.set(bucketInfo.key, bucket);
+    });
+
+    return Array.from(buckets.values())
+      .map((bucket) => {
+        const isPercent = ['percent', 'percent_critical', 'percent_fumble'].includes(metric.aggregation);
+        const isAverage = ['avg', 'average', 'mean'].includes(metric.aggregation);
+        const value = isPercent
+          ? bucket.denominator ? (bucket.numerator / bucket.denominator) * 100 : 0
+          : isAverage
+            ? bucket.count ? bucket.sum / bucket.count : 0
+            : metric.aggregation === 'sum'
+              ? bucket.sum
+              : bucket.count;
+        return {
+          ...bucket,
+          value,
+          value_label: formatMetricValue(value, metric),
+        };
+      })
+      .filter((entry) => Number(entry.value) > 0)
+      .sort((left, right) => right.value - left.value || right.messages - left.messages || left.label.localeCompare(right.label))
+      .slice(0, 5);
+  }
+
+  function renderKikimeter(liveSummary, selectedMetricId) {
+    const metrics = Array.isArray(liveSummary.profile_metrics) ? liveSummary.profile_metrics : [];
+    const metric = liveSummary.selected_metric || getSelectedProfileMetric(metrics, selectedMetricId);
+    const leaderboard = Array.isArray(liveSummary.leaderboard) ? liveSummary.leaderboard : [];
+    const profileStatus = liveSummary.metric_status || '';
+
+    if (!metric) {
+      return `
+        <div style="margin:7px 0 8px;padding:7px;border:1px solid rgba(255,255,255,.12);border-radius:6px;background:rgba(255,255,255,.04)">
+          <div style="font-weight:700;color:#f7edf2;margin-bottom:4px">Kikimeter live</div>
+          <div style="color:#b9a5ae;font-size:11px">${escapeHtml(profileStatus || 'Aucune mesure live disponible')}</div>
+        </div>
+      `;
+    }
+
+    const maxValue = Math.max(...leaderboard.map((entry) => Number(entry.value) || 0), 1);
+    const buttons = metrics.map((item) => {
+      const isSelected = item.id === metric.id;
+      return `
+        <button type="button" data-rollcodex-kiki-metric="${escapeHtml(item.id)}" title="${escapeHtml(item.label)}" style="cursor:pointer;background:${isSelected ? '#d92a78' : '#2a2228'};color:#f7edf2;border:1px solid ${isSelected ? 'rgba(255,255,255,.25)' : 'rgba(255,255,255,.14)'};border-radius:4px;min-height:24px;padding:3px 6px;font-size:11px;max-width:126px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(item.label)}</button>
+      `;
+    }).join('');
+    const rows = leaderboard.length ? leaderboard.map((entry, index) => {
+      const value = Number(entry.value) || 0;
+      const width = Math.max(8, Math.round((value / maxValue) * 100));
+      const title = entry.mapped && entry.sourceLabel !== entry.label ? `${entry.label} (${entry.sourceLabel})` : entry.label;
+      return `
+        <div style="display:grid;grid-template-columns:18px minmax(0,1fr) auto;align-items:center;gap:5px;min-width:0">
+          <span style="color:#b9a5ae">#${index + 1}</span>
+          <span title="${escapeHtml(title)}" style="position:relative;min-width:0;overflow:hidden;border-radius:4px;background:rgba(255,255,255,.06)">
+            <span style="display:block;width:${width}%;height:100%;min-height:18px;background:rgba(217,42,120,.22)"></span>
+            <span style="position:absolute;inset:1px 5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#f7edf2">${escapeHtml(entry.label)}</span>
+          </span>
+          <span style="color:#e9bfd0;font-weight:700">${escapeHtml(entry.value_label || value)}</span>
+        </div>
+      `;
+    }).join('') : '<div style="color:#b9a5ae">Aucun score visible</div>';
+
+    return `
+      <div style="margin:7px 0 8px;padding:7px;border:1px solid rgba(255,255,255,.12);border-radius:6px;background:rgba(255,255,255,.04)">
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:6px;margin-bottom:5px">
+          <span style="font-weight:700;color:#f7edf2">Kikimeter live</span>
+          <span style="color:#e9bfd0;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(metric.label)}</span>
+        </div>
+        <div style="display:flex;gap:4px;flex-wrap:wrap;margin-bottom:6px">${buttons}</div>
+        <div style="display:grid;gap:4px;font-size:11px">${rows}</div>
+      </div>
+    `;
   }
 
   function getRoll20GameTitle() {
@@ -488,11 +786,13 @@
     const connection = state.connection || null;
     const autoSettings = state.autoSettings || { enabled: true };
     const panelSettings = state.panelSettings || { collapsed: false, position: PANEL_POSITIONS[0] };
+    const kikimeterSettings = state.kikimeterSettings || { metric_id: '' };
     const liveSummary = state.liveSummary || { totals: createEmptyLiveMetricTotals(), top_participants: [] };
     const liveTotals = liveSummary.totals || createEmptyLiveMetricTotals();
     const topSpeaker = liveSummary.top_participants?.[0]?.speaker || 'Table Roll20';
     const status = state.status || (connection ? 'Connecte' : 'Non connecte');
-    const target = connection ? `${connection.campaign_label || 'Campagne'} / ${connection.table_label || 'Table'}` : 'Extension prete a connecter';
+    const target = connection ? renderConnectionTarget(connection) : escapeHtml('Extension prete a connecter');
+    const kikimeter = renderKikimeter(liveSummary, kikimeterSettings.metric_id);
     const connectButton = connection ? '' : '<button type="button" data-rollcodex-connect style="cursor:pointer;background:#d92a78;color:white;border:0;border-radius:4px;min-height:28px;padding:5px 8px">Connecter</button>';
     panel.style.cssText = getPanelCss(panelSettings);
 
@@ -517,9 +817,10 @@
         <button type="button" data-rollcodex-drag-handle title="Deplacer" style="cursor:grab;background:#2a2228;color:#f7edf2;border:1px solid rgba(255,255,255,.14);border-radius:4px;min-height:26px;padding:4px 7px">Deplacer</button>
         <button type="button" data-rollcodex-toggle-panel title="Reduire" style="cursor:pointer;background:#2a2228;color:#f7edf2;border:1px solid rgba(255,255,255,.14);border-radius:4px;min-height:26px;padding:4px 7px">Reduire</button>
       </div>
-      <div style="margin-bottom:6px;color:#e9bfd0">${escapeHtml(target)}</div>
+      <div style="margin-bottom:6px;min-width:0">${target}</div>
       <div style="margin-bottom:4px;color:#d7c1ca">Live: ${liveTotals.messages} msg - ${liveTotals.rolls} jets - ${liveTotals.criticals} crit - ${liveTotals.damage} degats - ${liveTotals.healing} soins</div>
       <div style="margin-bottom:6px;color:#b9a5ae">Actif: ${escapeHtml(topSpeaker)}</div>
+      ${kikimeter}
       <div data-rollcodex-status style="margin-bottom:8px;color:#c8f0d0">${escapeHtml(status)}</div>
       <div style="display:flex;gap:6px;flex-wrap:wrap">
         ${connectButton}
@@ -544,6 +845,9 @@
     panel.querySelector('[data-rollcodex-auto-minus]')?.addEventListener('click', () => adjustAutoIdle(-5));
     panel.querySelector('[data-rollcodex-auto-plus]')?.addEventListener('click', () => adjustAutoIdle(5));
     panel.querySelector('[data-rollcodex-forget]')?.addEventListener('click', forgetExtensionConnection);
+    panel.querySelectorAll('[data-rollcodex-kiki-metric]').forEach((button) => {
+      button.addEventListener('click', () => setKikimeterMetric(button.getAttribute('data-rollcodex-kiki-metric')));
+    });
   }
 
   function updatePanelStatus(status) {
@@ -589,13 +893,16 @@
     const connection = await getStorageValue(CONNECTION_KEY);
     const autoSettings = await getAutoSettings();
     const panelSettings = await getPanelSettings();
+    const kikimeterSettings = await getKikimeterSettings();
     const visibleMessages = getChatRows().map(normalizeChatRow).filter(Boolean);
     rebuildLiveMetricsFromMessages(visibleMessages);
+    const profile = connection ? await getMappingProfile(connection).catch(() => null) : null;
     renderPanel({
       connection,
       autoSettings,
       panelSettings,
-      liveSummary: summarizeLiveMetrics(),
+      kikimeterSettings,
+      liveSummary: summarizeLiveMetrics(profile, kikimeterSettings.metric_id, connection),
       status: status || (connection ? 'Connecte via extension' : 'Pret pour jumelage extension'),
     });
   }
@@ -726,9 +1033,10 @@
     (messages || []).forEach((message) => {
       if (!message?.key || liveMetricsState.messageKeys.has(message.key)) return;
       liveMetricsState.messageKeys.add(message.key);
+      liveMetricsState.messages.push(message);
       const speaker = normalizeText(message.speaker) || 'Roll20';
       if (!liveMetricsState.participants.has(speaker)) {
-        liveMetricsState.participants.set(speaker, { speaker, messages: 0, rolls: 0, damage: 0, healing: 0 });
+        liveMetricsState.participants.set(speaker, { speaker, messages: 0, rolls: 0, criticals: 0, fumbles: 0, damage: 0, healing: 0 });
       }
       const participant = liveMetricsState.participants.get(speaker);
       participant.messages += 1;
@@ -737,8 +1045,14 @@
         participant.rolls += 1;
         liveMetricsState.totals.rolls += 1;
       }
-      if (message.roll_natural_hint === 20) liveMetricsState.totals.criticals += 1;
-      if (message.roll_natural_hint === 1) liveMetricsState.totals.fumbles += 1;
+      if (message.roll_natural_hint === 20) {
+        participant.criticals += 1;
+        liveMetricsState.totals.criticals += 1;
+      }
+      if (message.roll_natural_hint === 1) {
+        participant.fumbles += 1;
+        liveMetricsState.totals.fumbles += 1;
+      }
       if (message.damage_total_hint != null) {
         participant.damage += message.damage_total_hint;
         liveMetricsState.totals.damage += message.damage_total_hint;
@@ -761,13 +1075,21 @@
     });
   }
 
-  function summarizeLiveMetrics() {
-    const topParticipants = Array.from(liveMetricsState.participants.values())
+  function summarizeLiveMetrics(profile = null, selectedMetricId = '', connection = null) {
+    const participants = Array.from(liveMetricsState.participants.values());
+    const topParticipants = participants
       .sort((a, b) => b.messages - a.messages || b.rolls - a.rolls)
       .slice(0, 5);
+    const profileMetrics = getProfileMetrics(profile);
+    const selectedMetric = getSelectedProfileMetric(profileMetrics, selectedMetricId);
+    const leaderboard = computeKikimeterLeaderboard(profile, selectedMetric);
     return {
       totals: { ...liveMetricsState.totals },
       top_participants: topParticipants,
+      profile_metrics: profileMetrics,
+      selected_metric: selectedMetric,
+      leaderboard,
+      metric_status: getMetricProfileStatus(profile, connection),
       recent_events: liveMetricsState.recentEvents.slice(0, LIVE_RECENT_EVENTS_LIMIT),
     };
   }
@@ -794,13 +1116,19 @@
     return normalizeText(value).toLowerCase();
   }
 
-  async function getMappingProfile(connection) {
+  function isFreshMappingProfileCache(stored, connectionId) {
+    if (stored?.connection_id !== connectionId || !stored?.profile?.schema_version) return false;
+    const fetchedAt = Date.parse(stored.fetched_at || '');
+    return Number.isFinite(fetchedAt) && Date.now() - fetchedAt < MAPPING_PROFILE_TTL_MS;
+  }
+
+  async function getMappingProfile(connection, options = {}) {
     if (!connection?.mapping_profile_endpoint || !connection.connection_id || !connection.connection_secret) {
       return null;
     }
 
     const stored = await getStorageValue(MAPPING_PROFILE_KEY);
-    if (stored?.connection_id === connection.connection_id && stored?.profile?.schema_version) {
+    if (!options.force && isFreshMappingProfileCache(stored, connection.connection_id)) {
       return stored.profile;
     }
 
@@ -817,7 +1145,9 @@
       },
     });
 
-    if (!response?.ok) return null;
+    if (!response?.ok) {
+      return stored?.connection_id === connection.connection_id && stored?.profile?.schema_version ? stored.profile : null;
+    }
 
     const profile = response.payload?.profile || null;
     if (profile) {
@@ -876,8 +1206,9 @@
 
   async function buildExtensionSnapshotPayload(connection, messages, { mode = 'manual', reason = 'extension_button' } = {}) {
     const lastMessage = messages[messages.length - 1];
-    const liveMetrics = summarizeLiveMetrics();
     const profile = await getMappingProfile(connection);
+    const kikimeterSettings = await getKikimeterSettings();
+    const liveMetrics = summarizeLiveMetrics(profile, kikimeterSettings.metric_id, connection);
     const mappingHints = buildMappingHintsFromProfile(profile, messages);
     return {
       provider: 'roll20',
@@ -1080,7 +1411,11 @@
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     if (message?.type === MESSAGE_EXTENSION_CONNECTED) {
       refreshPanel('Connexion RollCodex active');
-      if (message.connection) getMappingProfile(message.connection).catch(() => null);
+      if (message.connection) {
+        getMappingProfile(message.connection, { force: true })
+          .then(() => refreshPanel('Profil RollCodex recharge'))
+          .catch(() => null);
+      }
       sendResponse({ ok: true });
       return true;
     }

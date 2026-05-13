@@ -14,11 +14,19 @@ Fiche publique : `https://chromewebstore.google.com/detail/rollcodex-roll20/janf
 
 ## Installation locale
 
+Pour tester RollCodex en local sur `localhost:5173`, generer le canal dev :
+
+```powershell
+./scripts/package-extension.ps1 -Channel dev -OutputDirectory dist
+```
+
 1. Ouvrir `chrome://extensions`.
 2. Activer le mode developpeur.
 3. Cliquer sur `Charger l'extension non empaquetee`.
-4. Selectionner le dossier `integrations/roll20-rollcodex`.
+4. Selectionner le dossier `integrations/roll20-rollcodex/dist/unpacked-dev`.
 5. Recharger l'onglet Roll20 et l'onglet RollCodex.
+
+Le script garde un seul dossier non empaquete a la fois : generer le canal `dev` supprime `dist/unpacked-store`, et generer le canal `store` supprime `dist/unpacked-dev`. Ne gardez pas les deux charges dans Chrome en meme temps.
 
 ## Compatibilite
 
@@ -45,15 +53,16 @@ L'extension envoie des captures VTT a relire. RollCodex ne transforme pas automa
 - Jumelage depuis la table Roll20 vers RollCodex, avec choix du registre, du systeme, de la campagne et de la table.
 - Envoi manuel des messages visibles du chat.
 - Auto-capture locale apres activite chat, avec intervalle de securite pour eviter les envois trop rapproches.
-- Panneau live local avec compteurs de messages, jets, critiques, degats, soins et joueur le plus actif selon le chat visible.
-- Indices de mapping Roll20 joints aux captures : speakers detectes, types d'action approximatifs, limites du DOM Roll20.
+- Panneau live local avec kikimeter base sur les mesures du registre RollCodex cible.
+- Indices de mapping Roll20 joints aux captures : speakers detectes, mappings RollCodex deja confirmes, types d'action approximatifs, limites du DOM Roll20.
 
 ## Limites actuelles
 
 - La capture s'appuie sur les messages visibles/lisibles dans le DOM Roll20.
 - Les changements d'interface Roll20 peuvent necessiter une adaptation des selecteurs.
 - Roll20 ne fournit pas a l'extension les objets Actor/Item natifs de Foundry. Le mapping reste donc base sur les speakers et textes visibles.
-- Le paquet Chrome Web Store se genere avec `scripts/package-extension.ps1 -Channel store`.
+- Le paquet local localhost se genere avec `scripts/package-extension.ps1 -Channel dev`.
+- Le paquet Chrome Web Store se genere avec `scripts/package-extension.ps1 -Channel store` apres validation locale.
 - Les mises a jour Chrome Web Store peuvent etre automatisees via `.github/workflows/chrome-webstore-release.yml` apres configuration des secrets Google dans le depot de l'extension.
 
 ## Support

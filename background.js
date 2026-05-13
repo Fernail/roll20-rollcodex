@@ -62,21 +62,23 @@
   function buildExtensionConnection(payload, pendingPairing) {
     if (!pendingPairing || pendingPairing.connectionId !== payload.connectionId || pendingPairing.state !== payload.state) return null;
     if (!pendingPairing.connectionSecret) return null;
+    const mappingProfileEndpoint = String(payload.mappingProfileEndpoint || payload.mapping_profile_endpoint || '').trim();
+    if (mappingProfileEndpoint && !isAllowedMappingProfileEndpoint(mappingProfileEndpoint)) return null;
     return {
       provider: 'roll20',
       source_format: 'roll20_mod_json',
       connection_id: payload.connectionId,
       connection_secret: pendingPairing.connectionSecret,
       endpoint: payload.endpoint,
-      mapping_profile_endpoint: payload.mappingProfileEndpoint || '',
-      workspace_id: payload.workspaceId || '',
-      workspace_label: payload.workspaceLabel || '',
-      system_id: payload.systemId || '',
-      system_label: payload.systemLabel || '',
-      campaign_id: payload.campaignId || '',
-      campaign_label: payload.campaignLabel || '',
-      table_id: payload.tableId || '',
-      table_label: payload.tableLabel || '',
+      mapping_profile_endpoint: mappingProfileEndpoint,
+      workspace_id: payload.workspaceId || payload.workspace_id || '',
+      workspace_label: payload.workspaceLabel || payload.workspace_label || '',
+      system_id: payload.systemId || payload.system_id || '',
+      system_label: payload.systemLabel || payload.system_label || '',
+      campaign_id: payload.campaignId || payload.campaign_id || '',
+      campaign_label: payload.campaignLabel || payload.campaign_label || '',
+      table_id: payload.tableId || payload.table_id || '',
+      table_label: payload.tableLabel || payload.table_label || '',
       connected_at: new Date().toISOString(),
     };
   }
@@ -106,6 +108,52 @@
       table_label: payload.tableLabel || payload.table_label || '',
       connected_at: new Date().toISOString(),
       synced_from_rollcodex_at: new Date().toISOString(),
+    };
+  }
+
+  function buildSyncedConnectionContext(payload) {
+    const connectionId = String(payload?.connectionId || payload?.connection_id || '').trim();
+    const endpoint = String(payload?.endpoint || '').trim();
+    const mappingProfileEndpoint = String(payload?.mappingProfileEndpoint || payload?.mapping_profile_endpoint || '').trim();
+    if (payload?.provider !== 'roll20' || !connectionId) return null;
+    if (endpoint && !isAllowedSnapshotEndpoint(endpoint)) return null;
+    if (mappingProfileEndpoint && !isAllowedMappingProfileEndpoint(mappingProfileEndpoint)) return null;
+
+    return {
+      provider: 'roll20',
+      source_format: 'roll20_mod_json',
+      connection_id: connectionId,
+      endpoint,
+      mapping_profile_endpoint: mappingProfileEndpoint,
+      workspace_id: payload.workspaceId || payload.workspace_id || '',
+      workspace_label: payload.workspaceLabel || payload.workspace_label || '',
+      system_id: payload.systemId || payload.system_id || '',
+      system_label: payload.systemLabel || payload.system_label || '',
+      campaign_id: payload.campaignId || payload.campaign_id || '',
+      campaign_label: payload.campaignLabel || payload.campaign_label || '',
+      table_id: payload.tableId || payload.table_id || '',
+      table_label: payload.tableLabel || payload.table_label || '',
+      synced_from_rollcodex_at: new Date().toISOString(),
+    };
+  }
+
+  function mergeSyncedConnectionContext(existingConnection, contextPatch) {
+    if (!existingConnection || existingConnection.provider !== 'roll20') return null;
+    if (existingConnection.connection_id !== contextPatch.connection_id) return null;
+
+    return {
+      ...existingConnection,
+      endpoint: contextPatch.endpoint || existingConnection.endpoint,
+      mapping_profile_endpoint: contextPatch.mapping_profile_endpoint || existingConnection.mapping_profile_endpoint || '',
+      workspace_id: contextPatch.workspace_id || existingConnection.workspace_id || '',
+      workspace_label: contextPatch.workspace_label || existingConnection.workspace_label || '',
+      system_id: contextPatch.system_id || existingConnection.system_id || '',
+      system_label: contextPatch.system_label || existingConnection.system_label || '',
+      campaign_id: contextPatch.campaign_id || existingConnection.campaign_id || '',
+      campaign_label: contextPatch.campaign_label || existingConnection.campaign_label || '',
+      table_id: contextPatch.table_id || existingConnection.table_id || '',
+      table_label: contextPatch.table_label || existingConnection.table_label || '',
+      synced_from_rollcodex_at: contextPatch.synced_from_rollcodex_at,
     };
   }
 
@@ -210,7 +258,24 @@
   function syncExtensionConnection(payload, sendResponse) {
     const extensionConnection = buildSyncedExtensionConnection(payload);
     if (!extensionConnection) {
-      sendResponse({ ok: false, error: 'Connexion Roll20 invalide ou endpoint refuse.' });
+      const contextPatch = buildSyncedConnectionContext(payload);
+      if (!contextPatch) {
+        sendResponse({ ok: false, error: 'Connexion Roll20 invalide ou endpoint refuse.' });
+        return;
+      }
+
+      getStorageValue(CONNECTION_KEY)
+        .then((existingConnection) => {
+          const mergedConnection = mergeSyncedConnectionContext(existingConnection, contextPatch);
+          if (!mergedConnection) {
+            sendResponse({ ok: false, error: 'Connexion Roll20 existante introuvable pour ce contexte.' });
+            return null;
+          }
+          return setStorageValues({ [CONNECTION_KEY]: mergedConnection })
+            .then(() => notifyRoll20Tab(mergedConnection))
+            .then((notifiedRoll20Tab) => sendResponse({ ok: true, mode: 'context', notifiedRoll20Tab, connection: mergedConnection }));
+        })
+        .catch((error) => sendResponse({ ok: false, error: error?.message || 'Synchronisation Roll20 impossible.' }));
       return;
     }
 

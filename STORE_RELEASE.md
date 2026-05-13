@@ -11,13 +11,14 @@ Cette URL est publique et peut etre exposee dans le bundle Vite. Elle sert au bo
 ## Avant une release
 
 - Verifier que `manifest.json` porte la bonne version.
-- Recharger l'extension non empaquetee dans Chrome et tester une table Roll20.
-- Creer un tag Git correspondant, par exemple `v0.3.3`, puis le pousser sur GitHub.
+- Generer puis charger le canal local : `./scripts/package-extension.ps1 -Channel dev -OutputDirectory dist`.
+- Charger uniquement `dist/unpacked-dev` dans Chrome et tester une table Roll20 contre `localhost:5173`.
+- Quand le test local est valide, publier avec `scripts/auto-push --roll20-webstore-release` depuis le depot RollCodex racine, ou creer un tag Git correspondant, par exemple `v0.3.3`, puis le pousser sur GitHub.
 - Laisser GitHub Actions construire, verifier, uploader et soumettre le paquet Web Store.
 
 Le depot manuel du zip dans le Chrome Web Store Developer Dashboard reste un fallback d'urgence. La voie normale passe par `.github/workflows/chrome-webstore-release.yml`.
 
-Le canal `store` nettoie le paquet avant zip : l'extension ouvre `https://rollcodex.app`, retire les hosts locaux et ne garde que `https://rollcodex.app/*`, `https://app.roll20.net/*` et `https://*.supabase.co/*`. Le canal `dev` garde les hosts locaux pour les tests non empaquetes.
+Le canal `store` nettoie le paquet avant zip : l'extension ouvre `https://rollcodex.app`, retire les hosts locaux et ne garde que `https://rollcodex.app/*`, `https://app.roll20.net/*` et `https://*.supabase.co/*`. Le canal `dev` garde les hosts locaux pour les tests non empaquetes. Le script garde un seul dossier non empaquete a la fois : `unpacked-dev` ou `unpacked-store`, jamais les deux simultanement.
 
 ## Mise a jour automatisee depuis GitHub Actions
 
