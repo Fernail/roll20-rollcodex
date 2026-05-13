@@ -1,6 +1,5 @@
 (() => {
   const MESSAGE_CONFIRM = 'ROLLCODEX_ROLL20_CONFIRM';
-  const MESSAGE_SEND_CHAT_COMMAND = 'ROLLCODEX_ROLL20_SEND_CHAT_COMMAND';
   const MESSAGE_SEND_SNAPSHOT = 'ROLLCODEX_ROLL20_SEND_SNAPSHOT';
   const MESSAGE_FETCH_MAPPING_PROFILE = 'ROLLCODEX_ROLL20_FETCH_MAPPING_PROFILE';
   const MESSAGE_EXTENSION_CONNECTED = 'ROLLCODEX_ROLL20_EXTENSION_CONNECTED';
@@ -160,26 +159,7 @@
         return;
       }
 
-      chrome.tabs.query({ url: 'https://app.roll20.net/*' }, (tabs) => {
-        if (chrome.runtime.lastError) {
-          sendResponse({ ok: false, error: chrome.runtime.lastError.message });
-          return;
-        }
-
-        const targetTab = pickRoll20Tab(tabs);
-        if (!targetTab?.id) {
-          sendResponse({ ok: false, error: 'Onglet Roll20 introuvable. Ouvrez la table Roll20 puis reessayez.' });
-          return;
-        }
-
-        chrome.tabs.sendMessage(targetTab.id, { type: MESSAGE_SEND_CHAT_COMMAND, command }, (response) => {
-          if (chrome.runtime.lastError) {
-            sendResponse({ ok: false, error: chrome.runtime.lastError.message });
-            return;
-          }
-          sendResponse(response || { ok: false, error: 'Aucune reponse de l onglet Roll20.' });
-        });
-      });
+      sendResponse({ ok: false, error: 'Jumelage extension introuvable. Relancez la liaison depuis le panneau RollCodex dans Roll20.' });
     });
   }
 

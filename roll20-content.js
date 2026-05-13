@@ -538,18 +538,6 @@
     if (node) node.textContent = status;
   }
 
-  function readRollCodexStatusField(pattern) {
-    const text = normalizeText(document.querySelector('#textchat')?.textContent || '');
-    const match = text.match(pattern);
-    return normalizeText(match?.[0]);
-  }
-
-  function detectRollCodexChatConnection() {
-    const transport = readRollCodexStatusField(/Transport\s+HTTP[^<\n]*/i);
-    const connected = readRollCodexStatusField(/Connexion[^<\n]*(active|configuree|connectee)/i);
-    return { transport, connected };
-  }
-
   function beginPanelDrag(event) {
     const panel = document.getElementById(PANEL_ID);
     if (!panel) return;
@@ -590,13 +578,12 @@
     const panelSettings = await getPanelSettings();
     const visibleMessages = getChatRows().map(normalizeChatRow).filter(Boolean);
     recordLiveMetricsFromMessages(visibleMessages);
-    const chatStatus = detectRollCodexChatConnection();
     renderPanel({
       connection,
       autoSettings,
       panelSettings,
       liveSummary: summarizeLiveMetrics(),
-      status: status || chatStatus.connected || chatStatus.transport || (connection ? 'Connecte via extension' : 'Pret pour jumelage'),
+      status: status || (connection ? 'Connecte via extension' : 'Pret pour jumelage extension'),
     });
   }
 
@@ -611,7 +598,6 @@
   async function setAutoIdleMinutes(minutes) {
     const safeMinutes = Math.max(5, Math.min(180, Number(minutes) || 45));
     const next = await patchAutoSettings({ idleMs: safeMinutes * 60000 });
-    sendChatCommand(`!rollcodex idle ${safeMinutes}`);
     scheduleAutoSnapshot('roll20_auto_idle_changed');
     refreshPanel(`Auto ${Math.round(next.idleMs / 60000)} min`);
   }
@@ -932,7 +918,6 @@
   }
 
   async function endExtensionSession() {
-    sendChatCommand('!rollcodex end');
     const pending = await getPendingMessagesCount();
     await sendExtensionSnapshot({
       mode: 'manual',
@@ -1054,12 +1039,6 @@
     observer.observe(document.body, { childList: true, subtree: true });
   }
 
-  function announceBridgeReady(attempt = 1) {
-    const result = sendChatCommand(`!rollcodex bridge ready ${BRIDGE_VERSION}`);
-    if (result.ok || attempt >= 5) return;
-    window.setTimeout(() => announceBridgeReady(attempt + 1), 1500);
-  }
-
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     if (message?.type === MESSAGE_EXTENSION_CONNECTED) {
       refreshPanel('Connexion RollCodex active');
@@ -1072,7 +1051,6 @@
     return true;
   });
 
-  window.setTimeout(announceBridgeReady, 1200);
   startBridgeSnapshotObserver();
   startAutoCaptureObserver();
   document.addEventListener('visibilitychange', sendVisibilitySnapshot);
