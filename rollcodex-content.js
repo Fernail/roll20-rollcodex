@@ -32,6 +32,7 @@
       requestId,
       ok: Boolean(response?.ok),
       error: response?.error || '',
+      notifiedRoll20Tab: Boolean(response?.notifiedRoll20Tab),
     });
   }
 

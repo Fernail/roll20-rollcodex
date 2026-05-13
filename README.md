@@ -28,7 +28,7 @@ RollCodex aide les MJ a transformer des donnees VTT relues en activite de campag
 6. Cliquer sur `Envoyer` pour transmettre les messages visibles du chat a RollCodex, ou laisser l'auto-capture active apres une activite chat.
 7. Relire puis importer les donnees dans RollCodex.
 
-Le flux extension ne demande pas de script API Roll20 ni de commande `!rollcodex` dans le chat. Les anciennes commandes appartiennent au Mod Roll20 historique et ne sont pas requises pour tester l'extension Chrome.
+Le flux extension ne demande pas de script Roll20 installe ni de commande `!rollcodex` dans le chat. Les anciennes commandes appartiennent au Mod Roll20 historique et ne sont pas requises pour tester l'extension Chrome.
 
 L'extension envoie des captures VTT a relire. RollCodex ne transforme pas automatiquement ces donnees en narration et ne pretend pas deduire un contexte de jeu absent des logs.
 

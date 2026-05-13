@@ -481,6 +481,7 @@
     const topSpeaker = liveSummary.top_participants?.[0]?.speaker || 'Table Roll20';
     const status = state.status || (connection ? 'Connecte' : 'Non connecte');
     const target = connection ? `${connection.campaign_label || 'Campagne'} / ${connection.table_label || 'Table'}` : 'Extension prete a connecter';
+    const connectButton = connection ? '' : '<button type="button" data-rollcodex-connect style="cursor:pointer;background:#d92a78;color:white;border:0;border-radius:4px;min-height:28px;padding:5px 8px">Connecter</button>';
     panel.style.cssText = getPanelCss(panelSettings);
 
     if (panelSettings.collapsed) {
@@ -509,7 +510,7 @@
       <div style="margin-bottom:6px;color:#b9a5ae">Actif: ${escapeHtml(topSpeaker)}</div>
       <div data-rollcodex-status style="margin-bottom:8px;color:#c8f0d0">${escapeHtml(status)}</div>
       <div style="display:flex;gap:6px;flex-wrap:wrap">
-        <button type="button" data-rollcodex-connect style="cursor:pointer;background:#d92a78;color:white;border:0;border-radius:4px;min-height:28px;padding:5px 8px">Connecter</button>
+        ${connectButton}
         <button type="button" data-rollcodex-chat-send style="cursor:pointer;background:#335f9f;color:white;border:0;border-radius:4px;min-height:28px;padding:5px 8px" ${connection ? '' : 'disabled'}>Envoyer</button>
         <button type="button" data-rollcodex-end-session style="cursor:pointer;background:#4d426f;color:white;border:0;border-radius:4px;min-height:28px;padding:5px 8px" ${connection ? '' : 'disabled'}>Fin</button>
         <button type="button" data-rollcodex-auto style="cursor:pointer;background:${autoSettings.enabled ? '#236347' : '#5c4230'};color:white;border:0;border-radius:4px;min-height:28px;padding:5px 8px">Auto ${autoSettings.enabled ? 'ON' : 'OFF'}</button>
@@ -641,14 +642,21 @@
   }
 
   function getChatRows() {
-    const selectors = ['#textchat [data-messageid]', '#textchat [data-message-id]', '#textchat .message', '#textchat .textchatmessage', '#textchat [class*="message"]', '#textchat li', '#textchat div'];
+    const selectors = [
+      '#textchat [data-messageid]',
+      '#textchat [data-message-id]',
+      '#textchat .message',
+      '#textchat .textchatmessage',
+      '#textchat .chat-message',
+      '#textchat [class*="message"]',
+    ];
     const rows = [];
     const seen = new Set();
     selectors.forEach((selector) => {
       document.querySelectorAll(selector).forEach((node) => {
-        if (rows.includes(node)) return;
+        if (rows.some((row) => row === node || row.contains(node))) return;
         const text = normalizeText(node.textContent);
-        if (!text || text.length < 2 || seen.has(text)) return;
+        if (!text || text.length < 2 || seen.has(text) || isIgnoredChatText(text, '')) return;
         seen.add(text);
         rows.push(node);
       });
@@ -656,11 +664,26 @@
     return rows.slice(-MAX_EXTENSION_MESSAGES);
   }
 
+  function isIgnoredChatText(rawText, speaker = '') {
+    const text = normalizeText(rawText);
+    if (!text) return true;
+    if (text.includes(BRIDGE_SNAPSHOT_MARKER) || text.includes('!rollcodex bridge')) return true;
+
+    const lowerText = text.toLowerCase();
+    const lowerSpeaker = normalizeText(speaker).toLowerCase();
+    if (lowerSpeaker.includes('from rollcodex') || lowerSpeaker === 'rollcodex') return true;
+    if (/\(?from rollcodex\)?\s*:/i.test(text)) return true;
+    if (/\b(etat rollcodex|adresse rollcodex|transport http|relancer la liaison|code local|capture auto|jumelage en attente|messages en attente)\b/i.test(text)) return true;
+    if (lowerText.includes('rollcodex') && /\b(mod|adresse|transport http|connexion|cible|capture|jumelage|relancer|localtest|localhost)\b/i.test(text)) return true;
+    if (/\b(astuces de chat|jets de d[eé]s|chuchoter a un joueur|chuchoter à un joueur|inviter des joueurs|voici le lien joueur)\b/i.test(text)) return true;
+    return false;
+  }
+
   function normalizeChatRow(node, index) {
     const rawText = normalizeText(node.textContent);
-    if (!rawText || rawText.includes(BRIDGE_SNAPSHOT_MARKER) || rawText.includes('!rollcodex bridge')) return null;
     const key = getChatRowKey(node, index, rawText);
     const speaker = getChatSpeaker(node, rawText);
+    if (isIgnoredChatText(rawText, speaker)) return null;
     const figures = extractRollFigures(rawText);
     return {
       key,
