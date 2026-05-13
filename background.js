@@ -3,6 +3,7 @@
   const MESSAGE_SEND_SNAPSHOT = 'ROLLCODEX_ROLL20_SEND_SNAPSHOT';
   const MESSAGE_FETCH_MAPPING_PROFILE = 'ROLLCODEX_ROLL20_FETCH_MAPPING_PROFILE';
   const MESSAGE_EXTENSION_CONNECTED = 'ROLLCODEX_ROLL20_EXTENSION_CONNECTED';
+  const MESSAGE_SYNC_CONNECTION = 'ROLLCODEX_ROLL20_SYNC_CONNECTION';
   const CONFIRM_PREFIX = '!rollcodex confirm ';
   const BRIDGE_CLIENT = 'roll20-extension/0.3.2';
   const PENDING_PAIRING_KEY = 'rollcodexExtensionPendingPairing';
@@ -78,6 +79,49 @@
       table_label: payload.tableLabel || '',
       connected_at: new Date().toISOString(),
     };
+  }
+
+  function buildSyncedExtensionConnection(payload) {
+    const connectionId = String(payload?.connectionId || payload?.connection_id || '').trim();
+    const connectionSecret = String(payload?.connectionSecret || payload?.connection_secret || '').trim();
+    const endpoint = String(payload?.endpoint || '').trim();
+    const mappingProfileEndpoint = String(payload?.mappingProfileEndpoint || payload?.mapping_profile_endpoint || '').trim();
+    if (payload?.provider !== 'roll20' || !connectionId || !connectionSecret || !isAllowedSnapshotEndpoint(endpoint)) return null;
+    if (mappingProfileEndpoint && !isAllowedMappingProfileEndpoint(mappingProfileEndpoint)) return null;
+
+    return {
+      provider: 'roll20',
+      source_format: 'roll20_mod_json',
+      connection_id: connectionId,
+      connection_secret: connectionSecret,
+      endpoint,
+      mapping_profile_endpoint: mappingProfileEndpoint,
+      workspace_id: payload.workspaceId || payload.workspace_id || '',
+      workspace_label: payload.workspaceLabel || payload.workspace_label || '',
+      system_id: payload.systemId || payload.system_id || '',
+      system_label: payload.systemLabel || payload.system_label || '',
+      campaign_id: payload.campaignId || payload.campaign_id || '',
+      campaign_label: payload.campaignLabel || payload.campaign_label || '',
+      table_id: payload.tableId || payload.table_id || '',
+      table_label: payload.tableLabel || payload.table_label || '',
+      connected_at: new Date().toISOString(),
+      synced_from_rollcodex_at: new Date().toISOString(),
+    };
+  }
+
+  function notifyRoll20Tab(extensionConnection) {
+    return new Promise((resolve) => {
+      chrome.tabs.query({ url: 'https://app.roll20.net/*' }, (tabs) => {
+        const targetTab = pickRoll20Tab(tabs || []);
+        if (!targetTab?.id) {
+          resolve(false);
+          return;
+        }
+        chrome.tabs.sendMessage(targetTab.id, { type: MESSAGE_EXTENSION_CONNECTED, connection: extensionConnection }, () => {
+          resolve(!chrome.runtime.lastError);
+        });
+      });
+    });
   }
 
   function parseJsonText(text) {
@@ -163,6 +207,20 @@
     });
   }
 
+  function syncExtensionConnection(payload, sendResponse) {
+    const extensionConnection = buildSyncedExtensionConnection(payload);
+    if (!extensionConnection) {
+      sendResponse({ ok: false, error: 'Connexion Roll20 invalide ou endpoint refuse.' });
+      return;
+    }
+
+    setStorageValues({ [CONNECTION_KEY]: extensionConnection })
+      .then(() => removeStorageValue(PENDING_PAIRING_KEY))
+      .then(() => notifyRoll20Tab(extensionConnection))
+      .then((notifiedRoll20Tab) => sendResponse({ ok: true, notifiedRoll20Tab, connection: extensionConnection }))
+      .catch((error) => sendResponse({ ok: false, error: error?.message || 'Synchronisation Roll20 impossible.' }));
+  }
+
   async function sendSnapshotToRollCodex(request, sendResponse) {
     if (!isAllowedSnapshotRequest(request)) {
       sendResponse({ ok: false, error: 'Capture refusee par le bridge.' });
@@ -220,6 +278,10 @@
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     if (message?.type === MESSAGE_CONFIRM) {
       sendConfirmationToRoll20(message.command, sendResponse);
+      return true;
+    }
+    if (message?.type === MESSAGE_SYNC_CONNECTION) {
+      syncExtensionConnection(message.connection, sendResponse);
       return true;
     }
     if (message?.type === MESSAGE_SEND_SNAPSHOT) {

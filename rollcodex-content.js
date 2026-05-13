@@ -3,6 +3,8 @@
   const BRIDGE_SOURCE = 'rollcodex-roll20-bridge';
   const MESSAGE_CONFIRM = 'ROLLCODEX_ROLL20_CONFIRM';
   const MESSAGE_CONFIRM_RESULT = 'ROLLCODEX_ROLL20_CONFIRM_RESULT';
+  const MESSAGE_SYNC_CONNECTION = 'ROLLCODEX_ROLL20_SYNC_CONNECTION';
+  const MESSAGE_SYNC_CONNECTION_RESULT = 'ROLLCODEX_ROLL20_SYNC_CONNECTION_RESULT';
   const MESSAGE_PING = 'ROLLCODEX_ROLL20_BRIDGE_PING';
   const MESSAGE_READY = 'ROLLCODEX_ROLL20_BRIDGE_READY';
 
@@ -20,6 +22,16 @@
       requestId,
       ok: Boolean(response?.ok),
       error: response?.error || '',
+      notifiedRoll20Tab: Boolean(response?.notifiedRoll20Tab),
+    });
+  }
+
+  function replySyncConnectionResult(requestId, response) {
+    postToPage({
+      type: MESSAGE_SYNC_CONNECTION_RESULT,
+      requestId,
+      ok: Boolean(response?.ok),
+      error: response?.error || '',
     });
   }
 
@@ -30,6 +42,21 @@
 
     if (message.type === MESSAGE_PING) {
       replyReady(message.requestId);
+      return;
+    }
+
+    if (message.type === MESSAGE_SYNC_CONNECTION) {
+      chrome.runtime.sendMessage({
+        type: MESSAGE_SYNC_CONNECTION,
+        requestId: message.requestId,
+        connection: message.connection || {},
+      }, (response) => {
+        if (chrome.runtime.lastError) {
+          replySyncConnectionResult(message.requestId, { ok: false, error: chrome.runtime.lastError.message });
+          return;
+        }
+        replySyncConnectionResult(message.requestId, response);
+      });
       return;
     }
 
