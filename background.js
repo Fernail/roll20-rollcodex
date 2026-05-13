@@ -5,7 +5,7 @@
   const MESSAGE_EXTENSION_CONNECTED = 'ROLLCODEX_ROLL20_EXTENSION_CONNECTED';
   const MESSAGE_SYNC_CONNECTION = 'ROLLCODEX_ROLL20_SYNC_CONNECTION';
   const CONFIRM_PREFIX = '!rollcodex confirm ';
-  const BRIDGE_CLIENT = 'roll20-extension/0.3.2';
+  const BRIDGE_CLIENT = 'roll20-extension/0.3.3';
   const PENDING_PAIRING_KEY = 'rollcodexExtensionPendingPairing';
   const CONNECTION_KEY = 'rollcodexExtensionConnection';
 

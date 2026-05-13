@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "RollCodex Roll20",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "description": "Extension Roll20 pour connecter une table a RollCodex.",
   "icons": {
     "16": "icons/icon16.png",

@@ -7,7 +7,7 @@
   const BRIDGE_COMMAND_PREFIX = '!rollcodex bridge ';
   const BRIDGE_SNAPSHOT_MARKER = 'ROLLCODEX_BRIDGE_SNAPSHOT:';
   const BRIDGE_SNAPSHOT_TYPE = 'rollcodex:roll20-bridge-snapshot';
-  const BRIDGE_VERSION = '0.3.2';
+  const BRIDGE_VERSION = '0.3.3';
   const ROLLCODEX_APP_BASE_URL = 'http://localhost:5173';
   const ROLLCODEX_CONNECT_PATH = '/vtt/connect/roll20';
   const PENDING_PAIRING_KEY = 'rollcodexExtensionPendingPairing';
@@ -87,6 +87,18 @@
       damage: 0,
       healing: 0,
     };
+  }
+
+  function resetLiveMetricsState() {
+    liveMetricsState.messageKeys = new Set();
+    liveMetricsState.participants = new Map();
+    liveMetricsState.recentEvents = [];
+    liveMetricsState.totals = createEmptyLiveMetricTotals();
+  }
+
+  function rebuildLiveMetricsFromMessages(messages) {
+    resetLiveMetricsState();
+    recordLiveMetricsFromMessages(messages);
   }
 
   function toSafeNumber(value) {
@@ -578,7 +590,7 @@
     const autoSettings = await getAutoSettings();
     const panelSettings = await getPanelSettings();
     const visibleMessages = getChatRows().map(normalizeChatRow).filter(Boolean);
-    recordLiveMetricsFromMessages(visibleMessages);
+    rebuildLiveMetricsFromMessages(visibleMessages);
     renderPanel({
       connection,
       autoSettings,
@@ -673,8 +685,11 @@
     const lowerSpeaker = normalizeText(speaker).toLowerCase();
     if (lowerSpeaker.includes('from rollcodex') || lowerSpeaker === 'rollcodex') return true;
     if (/\(?from rollcodex\)?\s*:/i.test(text)) return true;
-    if (/\b(etat rollcodex|adresse rollcodex|transport http|relancer la liaison|code local|capture auto|jumelage en attente|messages en attente)\b/i.test(text)) return true;
-    if (lowerText.includes('rollcodex') && /\b(mod|adresse|transport http|connexion|cible|capture|jumelage|relancer|localtest|localhost)\b/i.test(text)) return true;
+    if (/\b(etat rollcodex|adresse rollcodex|transport http|relancer la liaison|code local|capture auto|jumelage en attente|messages en attente|connexion rollcodex|jumelage rollcodex)\b/i.test(text)) return true;
+    if (/\brollcodex\s*(?:[.!:]\s*)?(?:send|end|status|profile|auto|idle|disconnect|complete|connect|live|top)\b/i.test(text)) return true;
+    if (lowerText.includes('rollcodex') && /\b(mod|api|adresse|transport http|connexion|cible|capture|jumelage|relancer|pre-mapping|profil|inactivite|autorisez la connexion|oubliee|oubliée)\b/i.test(text)) return true;
+    if (lowerText.includes('rollcodex') && /\b(?:127\.0\.0\.1|local(?:test)?\.me|local\s*host)\b/i.test(text)) return true;
+    if (lowerText.includes('rollcodex') && /\b(envoie une capture|capture manuelle|fin de session|etat local|recharge le profil|coupe la capture|regle le delai|connexion locale)\b/i.test(text)) return true;
     if (/\b(astuces de chat|jets de d[eé]s|chuchoter a un joueur|chuchoter à un joueur|inviter des joueurs|voici le lien joueur)\b/i.test(text)) return true;
     return false;
   }
@@ -701,7 +716,7 @@
   async function collectExtensionMessages() {
     const lastSentKey = await getStorageValue(LAST_SENT_KEY);
     const messages = getChatRows().map(normalizeChatRow).filter(Boolean);
-    recordLiveMetricsFromMessages(messages);
+    rebuildLiveMetricsFromMessages(messages);
     if (!lastSentKey) return messages;
     const lastIndex = messages.findIndex((message) => message.key === lastSentKey);
     return lastIndex >= 0 ? messages.slice(lastIndex + 1) : messages;

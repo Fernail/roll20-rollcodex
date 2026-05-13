@@ -4,6 +4,14 @@ Extension Chrome pour connecter une table Roll20 a RollCodex.
 
 RollCodex aide les MJ a transformer des donnees VTT relues en activite de campagne, tendances et imports exploitables dans leur registre RollCodex.
 
+## Installation depuis le Chrome Web Store
+
+Fiche publique : `https://chromewebstore.google.com/detail/rollcodex-roll20/janfigfnhmgimnbeklajfhaccgcngmpc`
+
+1. Installer l'extension depuis la fiche Chrome Web Store.
+2. Ouvrir une table Roll20 dans Chrome.
+3. Utiliser le panneau RollCodex injecte dans la table pour jumeler le registre.
+
 ## Installation locale
 
 1. Ouvrir `chrome://extensions`.
@@ -16,7 +24,7 @@ RollCodex aide les MJ a transformer des donnees VTT relues en activite de campag
 
 - Navigateur verifie : Chrome desktop.
 - Roll20 : table ouverte dans `https://app.roll20.net/`.
-- Extension RollCodex Roll20 : 0.3.2.
+- Extension RollCodex Roll20 : 0.3.3.
 
 ## Utilisation
 

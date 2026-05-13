@@ -1,11 +1,21 @@
 # Publication Chrome Web Store
 
-## Avant publication
+## Fiche publiee
+
+- Extension ID : `janfigfnhmgimnbeklajfhaccgcngmpc`
+- URL publique : `https://chromewebstore.google.com/detail/rollcodex-roll20/janfigfnhmgimnbeklajfhaccgcngmpc`
+- Variable front RollCodex : `VITE_ROLL20_EXTENSION_WEB_STORE_URL`
+
+Cette URL est publique et peut etre exposee dans le bundle Vite. Elle sert au bouton `Chrome Web Store` du panneau d'import RollCodex.
+
+## Avant une release
 
 - Verifier que `manifest.json` porte la bonne version.
 - Recharger l'extension non empaquetee dans Chrome et tester une table Roll20.
-- Generer le zip Web Store depuis `integrations/roll20-rollcodex` : `./scripts/package-extension.ps1 -Channel store`.
-- Importer le zip produit dans le Chrome Web Store Developer Dashboard.
+- Creer un tag Git correspondant, par exemple `v0.3.3`, puis le pousser sur GitHub.
+- Laisser GitHub Actions construire, verifier, uploader et soumettre le paquet Web Store.
+
+Le depot manuel du zip dans le Chrome Web Store Developer Dashboard reste un fallback d'urgence. La voie normale passe par `.github/workflows/chrome-webstore-release.yml`.
 
 Le canal `store` nettoie le paquet avant zip : l'extension ouvre `https://rollcodex.app`, retire les hosts locaux et ne garde que `https://rollcodex.app/*`, `https://app.roll20.net/*` et `https://*.supabase.co/*`. Le canal `dev` garde les hosts locaux pour les tests non empaquetes.
 
@@ -27,7 +37,7 @@ Declencheurs :
 - `workflow_dispatch` avec `tag`, `dry_run: false`, `publish: true` : uploade puis soumet la version.
 - push d'un tag `vX.Y.Z` : uploade puis soumet automatiquement la version.
 
-Le tag doit toujours correspondre a la version du manifest. Exemple : `manifest.json` en `0.3.2` se publie avec le tag `v0.3.2`.
+Le tag doit toujours correspondre a la version du manifest. Exemple : `manifest.json` en `0.3.3` se publie avec le tag `v0.3.3`.
 
 Pour une premiere fiche Web Store, creer d'abord l'item dans le Developer Dashboard afin d'obtenir `CHROME_EXTENSION_ID`, renseigner les assets et la confidentialite, puis laisser le workflow gerer les mises a jour suivantes.
 
