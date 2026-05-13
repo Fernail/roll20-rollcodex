@@ -1,0 +1,125 @@
+name: Chrome Web Store Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag a publier, par exemple v0.3.2'
+        required: false
+        type: string
+      dry_run:
+        description: 'Construire et verifier le zip sans upload'
+        required: true
+        default: true
+        type: boolean
+      publish:
+        description: 'Soumettre la version au Chrome Web Store apres upload'
+        required: true
+        default: false
+        type: boolean
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      EVENT_NAME: ${{ github.event_name }}
+      DISPATCH_TAG: ${{ github.event.inputs.tag || '' }}
+      DISPATCH_DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+      DISPATCH_PUBLISH: ${{ github.event.inputs.publish || 'false' }}
+    steps:
+      - name: Checkout extension
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve release version
+        id: release
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${EVENT_NAME}" = "push" ]; then
+            tag="${GITHUB_REF_NAME}"
+            dry_run="false"
+            publish="true"
+          else
+            tag="${DISPATCH_TAG}"
+            dry_run="${DISPATCH_DRY_RUN}"
+            publish="${DISPATCH_PUBLISH}"
+          fi
+
+          if [ "${dry_run}" = "true" ]; then
+            publish="false"
+          fi
+          if [ -z "${tag}" ] && [ "${dry_run}" != "true" ]; then
+            echo "Un upload manuel Chrome Web Store doit cibler un tag." >&2
+            exit 1
+          fi
+          if [ -n "${tag}" ]; then
+            git fetch --tags --force
+            git checkout "${tag}"
+          fi
+
+          release_sha="$(git rev-parse HEAD)"
+          version="$(node -e "const fs = require('node:fs'); console.log(JSON.parse(fs.readFileSync('manifest.json', 'utf8')).version)")"
+          expected_tag="v${version}"
+          if [ -n "${tag}" ] && [ "${tag}" != "${expected_tag}" ]; then
+            echo "Le tag ${tag} ne correspond pas a manifest.json ${version}." >&2
+            exit 1
+          fi
+
+          echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
+          echo "sha=${release_sha}" >> "${GITHUB_OUTPUT}"
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          echo "dry_run=${dry_run}" >> "${GITHUB_OUTPUT}"
+          echo "publish=${publish}" >> "${GITHUB_OUTPUT}"
+          echo "zip_path=dist/rollcodex-roll20-v${version}-store.zip" >> "${GITHUB_OUTPUT}"
+
+      - name: Build Chrome package
+        shell: pwsh
+        run: ./scripts/package-extension.ps1 -Channel store -OutputDirectory dist
+
+      - name: Verify Chrome package
+        shell: bash
+        env:
+          ZIP_PATH: ${{ steps.release.outputs.zip_path }}
+        run: |
+          set -euo pipefail
+          test -f "${ZIP_PATH}"
+          unzip -p "${ZIP_PATH}" manifest.json > manifest.store.json
+          node -e "const fs = require('node:fs'); const manifest = JSON.parse(fs.readFileSync('manifest.store.json', 'utf8')); if (manifest.version !== '${{ steps.release.outputs.version }}') process.exit(1);"
+          if unzip -p "${ZIP_PATH}" manifest.json background.js roll20-content.js rollcodex-content.js | grep -E "localhost|127\.0\.0\.1|rollledger\.vercel\.app"; then
+            echo "Le paquet store contient encore un host local ou legacy." >&2
+            exit 1
+          fi
+
+      - name: Upload package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rollcodex-roll20-${{ steps.release.outputs.version }}-store
+          path: ${{ steps.release.outputs.zip_path }}
+
+      - name: Publish Chrome Web Store package
+        shell: bash
+        env:
+          ZIP_PATH: ${{ steps.release.outputs.zip_path }}
+          DRY_RUN: ${{ steps.release.outputs.dry_run }}
+          PUBLISH_TO_STORE: ${{ steps.release.outputs.publish }}
+          CHROME_EXTENSION_ID: ${{ secrets.CHROME_EXTENSION_ID }}
+          CHROME_CLIENT_ID: ${{ secrets.CHROME_CLIENT_ID }}
+          CHROME_CLIENT_SECRET: ${{ secrets.CHROME_CLIENT_SECRET }}
+          CHROME_REFRESH_TOKEN: ${{ secrets.CHROME_REFRESH_TOKEN }}
+        run: |
+          set -euo pipefail
+          args=(--zip "${ZIP_PATH}")
+          if [ "${DRY_RUN}" = "true" ]; then
+            args+=(--dry-run)
+          fi
+          if [ "${PUBLISH_TO_STORE}" = "true" ]; then
+            args+=(--publish)
+          fi
+          node scripts/publish-chrome-webstore.mjs "${args[@]}"

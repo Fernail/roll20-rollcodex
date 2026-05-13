@@ -44,6 +44,7 @@ L'extension envoie des captures VTT a relire. RollCodex ne transforme pas automa
 - Les changements d'interface Roll20 peuvent necessiter une adaptation des selecteurs.
 - Roll20 ne fournit pas a l'extension les objets Actor/Item natifs de Foundry. Le mapping reste donc base sur les speakers et textes visibles.
 - Le paquet Chrome Web Store se genere avec `scripts/package-extension.ps1 -Channel store`.
+- Les mises a jour Chrome Web Store peuvent etre automatisees via `.github/workflows/chrome-webstore-release.yml` apres configuration des secrets Google dans le depot de l'extension.
 
 ## Support
 

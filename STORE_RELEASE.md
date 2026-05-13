@@ -9,6 +9,28 @@
 
 Le canal `store` nettoie le paquet avant zip : l'extension ouvre `https://rollcodex.app`, retire les hosts locaux et ne garde que `https://rollcodex.app/*`, `https://app.roll20.net/*` et `https://*.supabase.co/*`. Le canal `dev` garde les hosts locaux pour les tests non empaquetes.
 
+## Mise a jour automatisee depuis GitHub Actions
+
+Le depot de l'extension contient le workflow `.github/workflows/chrome-webstore-release.yml`. Il construit le paquet store, verifie que le zip ne contient plus les hosts locaux, archive le zip comme artefact GitHub Actions, puis peut l'uploader et le soumettre au Chrome Web Store.
+
+Secrets GitHub requis dans le depot `roll20-rollcodex` :
+
+- `CHROME_EXTENSION_ID` : identifiant de l'extension dans le Chrome Web Store.
+- `CHROME_CLIENT_ID` : client OAuth Google Cloud autorise pour l'API Chrome Web Store.
+- `CHROME_CLIENT_SECRET` : secret du client OAuth.
+- `CHROME_REFRESH_TOKEN` : refresh token OAuth avec le scope `https://www.googleapis.com/auth/chromewebstore`.
+
+Declencheurs :
+
+- `workflow_dispatch` avec `dry_run: true` : construit et verifie le zip, sans appel au Store.
+- `workflow_dispatch` avec `tag`, `dry_run: false`, `publish: false` : uploade le zip sur la fiche Chrome Web Store sans soumettre la publication.
+- `workflow_dispatch` avec `tag`, `dry_run: false`, `publish: true` : uploade puis soumet la version.
+- push d'un tag `vX.Y.Z` : uploade puis soumet automatiquement la version.
+
+Le tag doit toujours correspondre a la version du manifest. Exemple : `manifest.json` en `0.3.2` se publie avec le tag `v0.3.2`.
+
+Pour une premiere fiche Web Store, creer d'abord l'item dans le Developer Dashboard afin d'obtenir `CHROME_EXTENSION_ID`, renseigner les assets et la confidentialite, puis laisser le workflow gerer les mises a jour suivantes.
+
 ## Points a fournir dans le Web Store
 
 - Nom : `RollCodex Roll20`
