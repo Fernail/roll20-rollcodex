@@ -1,6 +1,6 @@
 # RollCodex Roll20
 
-Extension Chrome pour connecter une table Roll20 a RollCodex.
+Extension navigateur pour connecter une table Roll20 a RollCodex.
 
 RollCodex aide les MJ a transformer des donnees VTT relues en activite de campagne, tendances et imports exploitables dans leur registre RollCodex.
 
@@ -9,7 +9,7 @@ RollCodex aide les MJ a transformer des donnees VTT relues en activite de campag
 Fiche publique : `https://chromewebstore.google.com/detail/rollcodex-roll20/janfigfnhmgimnbeklajfhaccgcngmpc`
 
 1. Installer l'extension depuis la fiche Chrome Web Store.
-2. Ouvrir une table Roll20 dans Chrome.
+2. Ouvrir une table Roll20 dans un navigateur cible.
 3. Utiliser le panneau RollCodex injecte dans la table pour jumeler le registre.
 
 ## Installation locale
@@ -20,19 +20,29 @@ Pour tester RollCodex en local sur `localhost:5173`, generer le canal dev :
 ./scripts/package-extension.ps1 -Channel dev -OutputDirectory dist
 ```
 
-1. Ouvrir `chrome://extensions`.
+Variantes locales :
+
+```powershell
+./scripts/package-extension.ps1 -Channel dev -OutputDirectory dist
+./scripts/package-extension.ps1 -Channel firefox-dev -OutputDirectory dist
+./scripts/package-extension.ps1 -Channel safari-dev -OutputDirectory dist
+```
+
+1. Ouvrir la page extensions du navigateur : `chrome://extensions`, `opera://extensions`, `edge://extensions` ou `brave://extensions`.
 2. Activer le mode developpeur.
 3. Cliquer sur `Charger l'extension non empaquetee`.
-4. Selectionner le dossier `integrations/roll20-rollcodex/dist/unpacked-dev`.
+4. Selectionner le dossier adapte : `dist/unpacked-dev`, `dist/unpacked-firefox-dev` ou `dist/unpacked-safari-dev`.
 5. Recharger l'onglet Roll20 et l'onglet RollCodex.
 
-Le script garde un seul dossier non empaquete a la fois : generer le canal `dev` supprime `dist/unpacked-store`, et generer le canal `store` supprime `dist/unpacked-dev`. Ne gardez pas les deux charges dans Chrome en meme temps.
+Ne gardez pas deux variantes chargees dans le meme navigateur en meme temps.
 
 ## Compatibilite
 
-- Navigateur verifie : Chrome desktop.
+- Navigateurs cibles : Chrome, Edge, Brave, Opera, Firefox et Safari desktop.
 - Roll20 : table ouverte dans `https://app.roll20.net/`.
 - Extension RollCodex Roll20 : 0.3.3.
+
+Firefox et Safari demandent un paquet dedie : leurs manifests et leurs scripts de fond ne sont pas strictement identiques a Chromium. Le code runtime evite les appels Chrome-only en utilisant `chrome` ou `browser` selon l'interface exposee.
 
 ## Utilisation
 
@@ -44,7 +54,7 @@ Le script garde un seul dossier non empaquete a la fois : generer le canal `dev`
 6. Cliquer sur `Envoyer` pour transmettre les messages visibles du chat a RollCodex, ou laisser l'auto-capture active apres une activite chat.
 7. Relire puis importer les donnees dans RollCodex.
 
-Le flux extension ne demande pas de script Roll20 installe ni de commande `!rollcodex` dans le chat. Les anciennes commandes appartiennent au Mod Roll20 historique et ne sont pas requises pour tester l'extension Chrome.
+Le flux extension ne demande pas de script Roll20 installe ni de commande `!rollcodex` dans le chat. Les anciennes commandes appartiennent au Mod Roll20 historique et ne sont pas requises pour tester l'extension navigateur.
 
 L'extension envoie des captures VTT a relire. RollCodex ne transforme pas automatiquement ces donnees en narration et ne pretend pas deduire un contexte de jeu absent des logs.
 
@@ -61,8 +71,11 @@ L'extension envoie des captures VTT a relire. RollCodex ne transforme pas automa
 - La capture s'appuie sur les messages visibles/lisibles dans le DOM Roll20.
 - Les changements d'interface Roll20 peuvent necessiter une adaptation des selecteurs.
 - Roll20 ne fournit pas a l'extension les objets Actor/Item natifs de Foundry. Le mapping reste donc base sur les speakers et textes visibles.
-- Le paquet local localhost se genere avec `scripts/package-extension.ps1 -Channel dev`.
+- Le paquet local Chromium localhost se genere avec `scripts/package-extension.ps1 -Channel dev`.
+- Le paquet local Firefox localhost se genere avec `scripts/package-extension.ps1 -Channel firefox-dev`.
+- Le paquet local Safari localhost se genere avec `scripts/package-extension.ps1 -Channel safari-dev`.
 - Le paquet Chrome Web Store se genere avec `scripts/package-extension.ps1 -Channel store` apres validation locale.
+- Les paquets publication Firefox et Safari se generent avec `scripts/package-extension.ps1 -Channel firefox-store` et `scripts/package-extension.ps1 -Channel safari-store`.
 - Les mises a jour Chrome Web Store peuvent etre automatisees via `.github/workflows/chrome-webstore-release.yml` apres configuration des secrets Google dans le depot de l'extension.
 
 ## Support

@@ -4,6 +4,7 @@
   const MESSAGE_FETCH_MAPPING_PROFILE = 'ROLLCODEX_ROLL20_FETCH_MAPPING_PROFILE';
   const MESSAGE_EXTENSION_CONNECTED = 'ROLLCODEX_ROLL20_EXTENSION_CONNECTED';
   const MESSAGE_SYNC_CONNECTION = 'ROLLCODEX_ROLL20_SYNC_CONNECTION';
+  const MESSAGE_OPEN_CONNECT_PAGE = 'ROLLCODEX_ROLL20_OPEN_CONNECT_PAGE';
   const CONFIRM_PREFIX = '!rollcodex confirm ';
   const BRIDGE_CLIENT = 'roll20-extension/0.3.3';
   const PENDING_PAIRING_KEY = 'rollcodexExtensionPendingPairing';
@@ -45,18 +46,111 @@
       || null;
   }
 
+  function getExtensionApi() {
+    return globalThis.chrome || globalThis.browser || null;
+  }
+
+  function readRuntimeLastError() {
+    return getExtensionApi()?.runtime?.lastError || null;
+  }
+
+  function callExtensionMethod(method, args, onSuccess, onError) {
+    let settled = false;
+    const resolveOnce = (handler, ...handlerArgs) => {
+      if (settled) return;
+      settled = true;
+      handler(...handlerArgs);
+    };
+    const callback = (...callbackArgs) => {
+      const runtimeError = readRuntimeLastError();
+      if (runtimeError) resolveOnce(onError, runtimeError);
+      else resolveOnce(onSuccess, ...callbackArgs);
+    };
+
+    try {
+      const maybePromise = method(...args, callback);
+      if (maybePromise && typeof maybePromise.then === 'function') {
+        maybePromise.then((result) => resolveOnce(onSuccess, result)).catch((error) => resolveOnce(onError, error));
+      }
+    } catch (callbackError) {
+      try {
+        const maybePromise = method(...args);
+        if (maybePromise && typeof maybePromise.then === 'function') {
+          maybePromise.then((result) => resolveOnce(onSuccess, result)).catch((error) => resolveOnce(onError, error));
+          return;
+        }
+      } catch (promiseError) {
+        resolveOnce(onError, promiseError);
+        return;
+      }
+      resolveOnce(onError, callbackError);
+    }
+  }
+
   function getStorageValue(key) {
     return new Promise((resolve) => {
-      chrome.storage.local.get(key, (result) => resolve(result?.[key] || null));
+      const storage = getExtensionApi()?.storage?.local;
+      if (!storage?.get) {
+        resolve(null);
+        return;
+      }
+      callExtensionMethod(storage.get.bind(storage), [key], (result) => resolve(result?.[key] || null), () => resolve(null));
     });
   }
 
   function setStorageValues(values) {
-    return new Promise((resolve) => chrome.storage.local.set(values, resolve));
+    return new Promise((resolve, reject) => {
+      const storage = getExtensionApi()?.storage?.local;
+      if (!storage?.set) {
+        reject(new Error('Extension storage unavailable.'));
+        return;
+      }
+      callExtensionMethod(storage.set.bind(storage), [values], () => resolve(true), reject);
+    });
   }
 
   function removeStorageValue(key) {
-    return new Promise((resolve) => chrome.storage.local.remove(key, resolve));
+    return new Promise((resolve, reject) => {
+      const storage = getExtensionApi()?.storage?.local;
+      if (!storage?.remove) {
+        reject(new Error('Extension storage unavailable.'));
+        return;
+      }
+      callExtensionMethod(storage.remove.bind(storage), [key], () => resolve(true), reject);
+    });
+  }
+
+  function queryTabs(queryInfo) {
+    return new Promise((resolve) => {
+      const tabs = getExtensionApi()?.tabs;
+      if (!tabs?.query) {
+        resolve([]);
+        return;
+      }
+      callExtensionMethod(tabs.query.bind(tabs), [queryInfo], (result) => resolve(result || []), () => resolve([]));
+    });
+  }
+
+  function sendTabMessage(tabId, message) {
+    return new Promise((resolve) => {
+      const tabs = getExtensionApi()?.tabs;
+      if (!tabs?.sendMessage || !tabId) {
+        resolve(false);
+        return;
+      }
+      callExtensionMethod(tabs.sendMessage.bind(tabs), [tabId, message], () => resolve(true), () => resolve(false));
+    });
+  }
+
+  function createTab(url) {
+    return new Promise((resolve, reject) => {
+      const tabs = getExtensionApi()?.tabs;
+      if (!tabs?.create) {
+        reject(new Error('Extension tabs API unavailable.'));
+        return;
+      }
+      callExtensionMethod(tabs.create.bind(tabs), [{ url }], (tab) => resolve(tab || null), reject);
+    });
   }
 
   function buildExtensionConnection(payload, pendingPairing) {
@@ -158,17 +252,10 @@
   }
 
   function notifyRoll20Tab(extensionConnection) {
-    return new Promise((resolve) => {
-      chrome.tabs.query({ url: 'https://app.roll20.net/*' }, (tabs) => {
-        const targetTab = pickRoll20Tab(tabs || []);
-        if (!targetTab?.id) {
-          resolve(false);
-          return;
-        }
-        chrome.tabs.sendMessage(targetTab.id, { type: MESSAGE_EXTENSION_CONNECTED, connection: extensionConnection }, () => {
-          resolve(!chrome.runtime.lastError);
-        });
-      });
+    return queryTabs({ url: 'https://app.roll20.net/*' }).then((tabs) => {
+      const targetTab = pickRoll20Tab(tabs || []);
+      if (!targetTab?.id) return false;
+      return sendTabMessage(targetTab.id, { type: MESSAGE_EXTENSION_CONNECTED, connection: extensionConnection });
     });
   }
 
@@ -208,6 +295,22 @@
     }
   }
 
+  function isAllowedRollCodexConnectUrl(connectUrl) {
+    try {
+      const url = new URL(String(connectUrl || ''));
+      const host = url.hostname.toLowerCase();
+      const isLocal = host === 'localhost' || host === '127.0.0.1' || host === 'localtest.me';
+      const isRollCodex = host === 'rollcodex.app' || host === 'rollledger.vercel.app';
+      return ['http:', 'https:'].includes(url.protocol)
+        && (isLocal || isRollCodex)
+        && url.pathname === '/vtt/connect/roll20'
+        && url.searchParams.has('connection_id')
+        && url.searchParams.has('state');
+    } catch (_error) {
+      return false;
+    }
+  }
+
   function isAllowedSnapshotRequest(request) {
     const payload = request?.payload;
     return request?.type === 'rollcodex:roll20-bridge-snapshot'
@@ -242,10 +345,12 @@
       const extensionConnection = buildExtensionConnection(payload, pendingPairing);
       if (extensionConnection) {
         setStorageValues({ [CONNECTION_KEY]: extensionConnection }).then(() => removeStorageValue(PENDING_PAIRING_KEY)).then(() => {
-          chrome.tabs.query({ url: 'https://app.roll20.net/*' }, (tabs) => {
+          queryTabs({ url: 'https://app.roll20.net/*' }).then((tabs) => {
             const targetTab = pickRoll20Tab(tabs || []);
-            if (targetTab?.id) chrome.tabs.sendMessage(targetTab.id, { type: MESSAGE_EXTENSION_CONNECTED, connection: extensionConnection });
-            sendResponse({ ok: true, mode: 'extension', connection: extensionConnection });
+            const notifyPromise = targetTab?.id
+              ? sendTabMessage(targetTab.id, { type: MESSAGE_EXTENSION_CONNECTED, connection: extensionConnection })
+              : Promise.resolve(false);
+            notifyPromise.then((notifiedRoll20Tab) => sendResponse({ ok: true, mode: 'extension', notifiedRoll20Tab, connection: extensionConnection }));
           });
         });
         return;
@@ -340,7 +445,22 @@
     }
   }
 
-  chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+  function openRollCodexConnectPage(url, sendResponse) {
+    if (!isAllowedRollCodexConnectUrl(url)) {
+      sendResponse({ ok: false, error: 'URL de jumelage RollCodex refusee.' });
+      return;
+    }
+
+    createTab(url)
+      .then((tab) => sendResponse({ ok: Boolean(tab?.id), tabId: tab?.id || null }))
+      .catch((error) => sendResponse({ ok: false, error: error?.message || 'Ouverture RollCodex impossible.' }));
+  }
+
+  getExtensionApi()?.runtime?.onMessage?.addListener((message, _sender, sendResponse) => {
+    if (message?.type === MESSAGE_OPEN_CONNECT_PAGE) {
+      openRollCodexConnectPage(message.url, sendResponse);
+      return true;
+    }
     if (message?.type === MESSAGE_CONFIRM) {
       sendConfirmationToRoll20(message.command, sendResponse);
       return true;

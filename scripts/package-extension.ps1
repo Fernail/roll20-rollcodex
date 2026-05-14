@@ -1,5 +1,5 @@
 param(
-  [ValidateSet("store", "dev")]
+  [ValidateSet("store", "dev", "firefox-store", "firefox-dev", "safari-store", "safari-dev")]
   [string]$Channel = "store",
   [string]$OutputDirectory = "dist"
 )
@@ -11,20 +11,27 @@ $manifestPath = Join-Path $root "manifest.json"
 $manifest = Get-Content -Raw -Path $manifestPath | ConvertFrom-Json
 $version = $manifest.version
 $channelName = $Channel.ToLowerInvariant()
-$zipName = "rollcodex-roll20-v$version-$channelName.zip"
+if ($channelName -eq "store" -or $channelName -eq "dev") {
+  $browserName = "chromium"
+  $releaseName = $channelName
+} else {
+  $channelParts = $channelName.Split("-", 2)
+  $browserName = $channelParts[0]
+  $releaseName = $channelParts[1]
+}
+
+$zipSuffix = if ($browserName -eq "chromium") { $releaseName } else { $channelName }
+$zipName = "rollcodex-roll20-v$version-$zipSuffix.zip"
 $outputPath = Join-Path $root $OutputDirectory
 $zipPath = Join-Path $outputPath $zipName
 $stagingPath = Join-Path $outputPath "package-$channelName"
 $unpackedPath = Join-Path $outputPath "unpacked-$channelName"
-$otherChannelName = if ($channelName -eq "store") { "dev" } else { "store" }
-$otherUnpackedPath = Join-Path $outputPath "unpacked-$otherChannelName"
 $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 
 New-Item -ItemType Directory -Force -Path $outputPath | Out-Null
 if (Test-Path $zipPath) { Remove-Item -Force $zipPath }
 if (Test-Path $stagingPath) { Remove-Item -Recurse -Force $stagingPath }
 if (Test-Path $unpackedPath) { Remove-Item -Recurse -Force $unpackedPath }
-if (Test-Path $otherUnpackedPath) { Remove-Item -Recurse -Force $otherUnpackedPath }
 New-Item -ItemType Directory -Force -Path $stagingPath | Out-Null
 
 $files = @(
@@ -56,22 +63,61 @@ foreach ($directory in $directories) {
   Copy-Item -Recurse -Path (Join-Path $root $directory) -Destination (Join-Path $stagingPath $directory)
 }
 
-if ($channelName -eq "store") {
-  $storeManifestPath = Join-Path $stagingPath "manifest.json"
-  $storeManifest = Get-Content -Raw -Path $storeManifestPath | ConvertFrom-Json
-  $storeManifest.host_permissions = @(
+function Set-ManifestProperty($target, $name, $value) {
+  $target | Add-Member -NotePropertyName $name -NotePropertyValue $value -Force
+}
+
+function Remove-ManifestProperty($target, $name) {
+  if ($target.PSObject.Properties[$name]) {
+    $target.PSObject.Properties.Remove($name)
+  }
+}
+
+function Set-BrowserManifest($target, $browser) {
+  if ($browser -eq "firefox") {
+    Set-ManifestProperty $target "background" ([pscustomobject]@{
+      scripts = @("background.js")
+    })
+    Set-ManifestProperty $target "browser_specific_settings" ([pscustomobject]@{
+      gecko = [pscustomobject]@{
+        id = "rollcodex-roll20@rollcodex.app"
+        strict_min_version = "121.0"
+      }
+    })
+    return
+  }
+
+  if ($browser -eq "safari") {
+    Set-ManifestProperty $target "background" ([pscustomobject]@{
+      scripts = @("background.js")
+      service_worker = "background.js"
+      preferred_environment = @("service_worker", "document")
+    })
+    Remove-ManifestProperty $target "browser_specific_settings"
+    return
+  }
+
+  Set-ManifestProperty $target "background" ([pscustomobject]@{
+    service_worker = "background.js"
+  })
+  Remove-ManifestProperty $target "browser_specific_settings"
+}
+
+$stagedManifestPath = Join-Path $stagingPath "manifest.json"
+$stagedManifest = Get-Content -Raw -Path $stagedManifestPath | ConvertFrom-Json
+
+if ($releaseName -eq "store") {
+  $stagedManifest.host_permissions = @(
     "https://rollcodex.app/*",
     "https://*.supabase.co/*",
     "https://app.roll20.net/*"
   )
 
-  foreach ($contentScript in $storeManifest.content_scripts) {
+  foreach ($contentScript in $stagedManifest.content_scripts) {
     if (@($contentScript.js) -contains "rollcodex-content.js") {
       $contentScript.matches = @("https://rollcodex.app/*")
     }
   }
-
-  [System.IO.File]::WriteAllText($storeManifestPath, ($storeManifest | ConvertTo-Json -Depth 20), $utf8NoBom)
 
   $roll20ContentPath = Join-Path $stagingPath "roll20-content.js"
   $roll20Content = Get-Content -Raw -Path $roll20ContentPath
@@ -88,20 +134,26 @@ if ($channelName -eq "store") {
   $localEndpointPattern = "\s+const isLocal = host === 'localhost' \|\| host === '127\.0\.0\.1';\r?\n\s+const isSupabase = host\.endsWith\('\.supabase\.co'\);\r?\n\s+return \['http:', 'https:'\]\.includes\(url\.protocol\)\r?\n\s+&& \(isLocal \|\| isSupabase\)"
   $storeEndpointGuard = "`n      const isSupabase = host.endsWith('.supabase.co');`n      return url.protocol === 'https:'`n        && isSupabase"
   $patchedBackgroundContent = $backgroundContent -replace $localEndpointPattern, $storeEndpointGuard
-  if ($patchedBackgroundContent.Contains("localhost") -or $patchedBackgroundContent.Contains("127.0.0.1")) {
+  $localConnectUrlPattern = "\s+const isLocal = host === 'localhost' \|\| host === '127\.0\.0\.1' \|\| host === 'localtest\.me';\r?\n\s+const isRollCodex = host === 'rollcodex\.app' \|\| host === 'rollledger\.vercel\.app';\r?\n\s+return \['http:', 'https:'\]\.includes\(url\.protocol\)\r?\n\s+&& \(isLocal \|\| isRollCodex\)"
+  $storeConnectUrlGuard = "`n      const isRollCodex = host === 'rollcodex.app';`n      return url.protocol === 'https:'`n        && isRollCodex"
+  $patchedBackgroundContent = $patchedBackgroundContent -replace $localConnectUrlPattern, $storeConnectUrlGuard
+  if ($patchedBackgroundContent.Contains("localhost") -or $patchedBackgroundContent.Contains("127.0.0.1") -or $patchedBackgroundContent.Contains("localtest.me")) {
     throw "Endpoints locaux encore presents dans background.js apres patch store."
   }
   [System.IO.File]::WriteAllText($backgroundPath, $patchedBackgroundContent, $utf8NoBom)
 }
+
+Set-BrowserManifest $stagedManifest $browserName
+[System.IO.File]::WriteAllText($stagedManifestPath, ($stagedManifest | ConvertTo-Json -Depth 20), $utf8NoBom)
 
 $packageEntries = Get-ChildItem -Force -Path $stagingPath | ForEach-Object { $_.FullName }
 Compress-Archive -Path $packageEntries -DestinationPath $zipPath
 Copy-Item -Recurse -Path $stagingPath -Destination $unpackedPath
 Remove-Item -Recurse -Force $stagingPath
 
-Write-Host "Package Chrome $channelName pret: $zipPath"
+Write-Host "Package $browserName $releaseName pret: $zipPath"
 Write-Host "Extension non empaquetee $channelName prete: $unpackedPath"
-if ($channelName -eq "store") {
+if ($releaseName -eq "store") {
   Write-Host "Canal store: rollcodex.app, app.roll20.net et Supabase uniquement."
 } else {
   Write-Host "Canal dev: localhost, localtest.me, app.roll20.net et Supabase."

@@ -3,6 +3,7 @@
   const MESSAGE_SEND_SNAPSHOT = 'ROLLCODEX_ROLL20_SEND_SNAPSHOT';
   const MESSAGE_FETCH_MAPPING_PROFILE = 'ROLLCODEX_ROLL20_FETCH_MAPPING_PROFILE';
   const MESSAGE_EXTENSION_CONNECTED = 'ROLLCODEX_ROLL20_EXTENSION_CONNECTED';
+  const MESSAGE_OPEN_CONNECT_PAGE = 'ROLLCODEX_ROLL20_OPEN_CONNECT_PAGE';
   const CONFIRM_PREFIX = '!rollcodex confirm ';
   const BRIDGE_COMMAND_PREFIX = '!rollcodex bridge ';
   const BRIDGE_SNAPSHOT_MARKER = 'ROLLCODEX_BRIDGE_SNAPSHOT:';
@@ -208,18 +209,78 @@
       .replace(/'/g, '&#39;');
   }
 
+  function getExtensionApi() {
+    return globalThis.chrome || globalThis.browser || null;
+  }
+
+  function readRuntimeLastError() {
+    return getExtensionApi()?.runtime?.lastError || null;
+  }
+
+  function callExtensionMethod(method, args, onSuccess, onError) {
+    let settled = false;
+    const resolveOnce = (handler, ...handlerArgs) => {
+      if (settled) return;
+      settled = true;
+      handler(...handlerArgs);
+    };
+    const callback = (...callbackArgs) => {
+      const runtimeError = readRuntimeLastError();
+      if (runtimeError) resolveOnce(onError, runtimeError);
+      else resolveOnce(onSuccess, ...callbackArgs);
+    };
+
+    try {
+      const maybePromise = method(...args, callback);
+      if (maybePromise && typeof maybePromise.then === 'function') {
+        maybePromise.then((result) => resolveOnce(onSuccess, result)).catch((error) => resolveOnce(onError, error));
+      }
+    } catch (callbackError) {
+      try {
+        const maybePromise = method(...args);
+        if (maybePromise && typeof maybePromise.then === 'function') {
+          maybePromise.then((result) => resolveOnce(onSuccess, result)).catch((error) => resolveOnce(onError, error));
+          return;
+        }
+      } catch (promiseError) {
+        resolveOnce(onError, promiseError);
+        return;
+      }
+      resolveOnce(onError, callbackError);
+    }
+  }
+
   function getStorageValue(key) {
     return new Promise((resolve) => {
-      chrome.storage.local.get(key, (result) => resolve(result?.[key] || null));
+      const storage = getExtensionApi()?.storage?.local;
+      if (!storage?.get) {
+        resolve(null);
+        return;
+      }
+      callExtensionMethod(storage.get.bind(storage), [key], (result) => resolve(result?.[key] || null), () => resolve(null));
     });
   }
 
   function setStorageValues(values) {
-    return new Promise((resolve) => chrome.storage.local.set(values, resolve));
+    return new Promise((resolve, reject) => {
+      const storage = getExtensionApi()?.storage?.local;
+      if (!storage?.set) {
+        reject(new Error('Extension storage unavailable.'));
+        return;
+      }
+      callExtensionMethod(storage.set.bind(storage), [values], () => resolve(true), reject);
+    });
   }
 
   function removeStorageValue(key) {
-    return new Promise((resolve) => chrome.storage.local.remove(key, resolve));
+    return new Promise((resolve, reject) => {
+      const storage = getExtensionApi()?.storage?.local;
+      if (!storage?.remove) {
+        reject(new Error('Extension storage unavailable.'));
+        return;
+      }
+      callExtensionMethod(storage.remove.bind(storage), [key], () => resolve(true), reject);
+    });
   }
 
   function isExtensionContextInvalidatedError(error) {
@@ -239,25 +300,28 @@
 
   function sendRuntimeMessage(message) {
     return new Promise((resolve) => {
-      if (extensionContextInvalidated || !chrome?.runtime?.id) {
+      const runtime = getExtensionApi()?.runtime;
+      if (extensionContextInvalidated || !runtime?.id || !runtime?.sendMessage) {
         resolve({ ok: false, error: 'Extension Roll20 rechargee. Rechargez la page Roll20.' });
         return;
       }
-      try {
-        chrome.runtime.sendMessage(message, (response) => {
-          const runtimeError = chrome.runtime.lastError;
-          if (runtimeError) {
-            markExtensionContextInvalidated(runtimeError);
-            resolve({ ok: false, error: stringifyExtensionError(runtimeError) });
-            return;
-          }
-          resolve(response || { ok: false, error: 'Aucune reponse du bridge Roll20.' });
-        });
-      } catch (error) {
-        markExtensionContextInvalidated(error);
-        resolve({ ok: false, error: stringifyExtensionError(error) });
-      }
+      callExtensionMethod(
+        runtime.sendMessage.bind(runtime),
+        [message],
+        (response) => resolve(response || { ok: false, error: 'Aucune reponse du bridge Roll20.' }),
+        (error) => {
+          markExtensionContextInvalidated(error);
+          resolve({ ok: false, error: stringifyExtensionError(error) });
+        },
+      );
     });
+  }
+
+  async function openRollCodexPairingUrl(url) {
+    const response = await sendRuntimeMessage({ type: MESSAGE_OPEN_CONNECT_PAGE, url });
+    if (response?.ok) return true;
+    window.open(url, '_blank', 'noopener,noreferrer');
+    return false;
   }
 
   async function getAutoSettings() {
@@ -431,9 +495,42 @@
     `).join('');
   }
 
+  function normalizeProfileMetricResult(result) {
+    if (!result || typeof result !== 'object') return null;
+    const value = toSafeNumber(result.value);
+    const label = normalizeText(result.label || result.value_label || result.valueLabel);
+    const count = toSafeNumber(result.count);
+    if (value == null && !label) return null;
+    return {
+      value: value ?? 0,
+      label: label || String(value ?? 0),
+      count,
+    };
+  }
+
+  function normalizeProfileMetricRankingEntry(entry, index) {
+    if (!entry || typeof entry !== 'object') return null;
+    const value = toSafeNumber(entry.value);
+    const label = normalizeText(entry.label || entry.target_label || entry.name);
+    if (value == null || !label) return null;
+    const valueLabel = normalizeText(entry.value_label || entry.valueLabel || entry.label_value);
+    return {
+      key: normalizeText(entry.id || entry.key || `ranking-${index}`),
+      label,
+      sourceLabel: normalizeText(entry.source_label || entry.sourceLabel || entry.detail || label),
+      mapped: true,
+      value,
+      value_label: valueLabel || String(value),
+      count: toSafeNumber(entry.count),
+    };
+  }
+
   function normalizeProfileMetric(metric) {
     const id = normalizeText(metric?.id || metric?.key || metric?.name);
     if (!id || metric?.live_supported === false) return null;
+    const ranking = Array.isArray(metric?.ranking)
+      ? metric.ranking.map(normalizeProfileMetricRankingEntry).filter(Boolean)
+      : [];
     return {
       id,
       label: normalizeText(metric?.name || metric?.label || id),
@@ -446,11 +543,20 @@
         ? metric.filter_event_type.map((item) => normalizeText(item).toLowerCase()).filter(Boolean)
         : [],
       sortOrder: Number(metric?.sort_order) || 0,
+      result: normalizeProfileMetricResult(metric?.result),
+      ranking,
+      rankingDimension: normalizeText(metric?.ranking_dimension || metric?.rankingDimension),
+      scopeHint: normalizeText(metric?.scope_hint || metric?.scopeHint),
     };
   }
 
   function getProfileMetrics(profile) {
-    return (Array.isArray(profile?.metrics) ? profile.metrics : [])
+    const rawMetrics = Array.isArray(profile?.metrics)
+      ? profile.metrics
+      : Array.isArray(profile?.measures)
+        ? profile.measures
+        : [];
+    return rawMetrics
       .map(normalizeProfileMetric)
       .filter(Boolean)
       .sort((left, right) => left.sortOrder - right.sortOrder || left.label.localeCompare(right.label));
@@ -465,7 +571,11 @@
     if (!connection) return 'Connexion RollCodex requise';
     if (!connection.mapping_profile_endpoint) return 'Profil RollCodex non synchronise';
     if (!profile?.schema_version) return 'Profil RollCodex indisponible';
-    const metricCount = Array.isArray(profile.metrics) ? profile.metrics.length : 0;
+    const metricCount = Array.isArray(profile.metrics)
+      ? profile.metrics.length
+      : Array.isArray(profile.measures)
+        ? profile.measures.length
+        : 0;
     if (!metricCount) return 'Aucune mesure dans le registre cible';
     if (!getProfileMetrics(profile).length) return 'Aucune mesure compatible live dans le registre';
     return '';
@@ -578,9 +688,31 @@
     return String(Math.round(value));
   }
 
-  function computeKikimeterLeaderboard(profile, metric) {
-    if (!metric) return [];
+  function metricAggregationFamily(metric) {
+    const aggregation = metric?.aggregation || 'count';
+    const isPercent = ['percent', 'percent_critical', 'percent_fumble'].includes(aggregation);
+    const isAverage = ['avg', 'average', 'mean'].includes(aggregation);
+    return {
+      aggregation,
+      isPercent,
+      isAverage,
+      isAdditive: !isPercent && !isAverage,
+    };
+  }
+
+  function bucketValueForMetric(bucket, metric) {
+    const family = metricAggregationFamily(metric);
+    if (family.isPercent) return bucket.denominator ? (bucket.numerator / bucket.denominator) * 100 : 0;
+    if (family.isAverage) return bucket.count ? bucket.sum / bucket.count : 0;
+    if (family.aggregation === 'sum') return bucket.sum;
+    return bucket.count;
+  }
+
+  function computeLiveDeltaForMetric(profile, metric) {
     const buckets = new Map();
+    const totals = { count: 0, sum: 0, numerator: 0, denominator: 0, messages: 0 };
+    if (!metric) return { buckets, totals };
+
     liveMetricsState.messages.forEach((message) => {
       if (!messageMatchesMetricFilter(message, metric)) return;
       const bucketInfo = getMetricBucket(profile, message);
@@ -592,31 +724,129 @@
         denominator: 0,
         messages: 0,
       };
+      const before = { count: bucket.count, sum: bucket.sum, numerator: bucket.numerator, denominator: bucket.denominator };
       bucket.messages += 1;
       addMetricContribution(bucket, metric, message);
+      totals.messages += 1;
+      totals.count += bucket.count - before.count;
+      totals.sum += bucket.sum - before.sum;
+      totals.numerator += bucket.numerator - before.numerator;
+      totals.denominator += bucket.denominator - before.denominator;
       buckets.set(bucketInfo.key, bucket);
     });
 
-    return Array.from(buckets.values())
-      .map((bucket) => {
-        const isPercent = ['percent', 'percent_critical', 'percent_fumble'].includes(metric.aggregation);
-        const isAverage = ['avg', 'average', 'mean'].includes(metric.aggregation);
-        const value = isPercent
-          ? bucket.denominator ? (bucket.numerator / bucket.denominator) * 100 : 0
-          : isAverage
-            ? bucket.count ? bucket.sum / bucket.count : 0
-            : metric.aggregation === 'sum'
-              ? bucket.sum
-              : bucket.count;
-        return {
-          ...bucket,
-          value,
-          value_label: formatMetricValue(value, metric),
-        };
-      })
-      .filter((entry) => Number(entry.value) > 0)
-      .sort((left, right) => right.value - left.value || right.messages - left.messages || left.label.localeCompare(right.label))
-      .slice(0, 5);
+    return { buckets, totals };
+  }
+
+  function findBaselineEntryForBucket(baselineRanking, bucket) {
+    const bucketSource = normalizeMappingKey(bucket.sourceLabel);
+    const bucketLabel = normalizeMappingKey(bucket.label);
+    return baselineRanking.find((entry) => {
+      const entrySource = normalizeMappingKey(entry.sourceLabel);
+      const entryLabel = normalizeMappingKey(entry.label);
+      return (bucketSource && entrySource === bucketSource)
+        || (bucketLabel && entryLabel === bucketLabel);
+    }) || null;
+  }
+
+  function computeBaselinePlusLive(profile, metric) {
+    if (!metric) return { metricResult: null, leaderboard: [] };
+
+    const baselineResult = metric.result || null;
+    const baselineRanking = Array.isArray(metric.ranking) ? metric.ranking : [];
+    const { buckets, totals } = computeLiveDeltaForMetric(profile, metric);
+    const family = metricAggregationFamily(metric);
+
+    const totalDelta = bucketValueForMetric(totals, metric);
+    const baselineValue = Number(baselineResult?.value) || 0;
+    const mergedValue = family.isAdditive ? baselineValue + totalDelta : baselineValue;
+    const hasDelta = totalDelta > 0 || totals.messages > 0;
+    const metricResult = baselineResult || hasDelta ? {
+      value: mergedValue,
+      label: family.isAdditive
+        ? formatMetricValue(mergedValue, metric)
+        : (baselineResult?.label || formatMetricValue(baselineValue, metric)),
+      count: (Number(baselineResult?.count) || 0) + totals.messages,
+      delta_value: totalDelta,
+      delta_label: hasDelta && totalDelta > 0 ? `+${formatMetricValue(totalDelta, metric)}` : '',
+      delta_count: totals.messages,
+      has_delta: hasDelta,
+    } : null;
+
+    const merged = new Map();
+    baselineRanking.forEach((entry) => {
+      const key = entry.key || `baseline-${merged.size}`;
+      merged.set(key, {
+        key,
+        label: entry.label,
+        sourceLabel: entry.sourceLabel || entry.label,
+        mapped: entry.mapped !== false,
+        baseline_value: Number(entry.value) || 0,
+        baseline_label: entry.value_label || formatMetricValue(Number(entry.value) || 0, metric),
+        delta_value: 0,
+        delta_messages: 0,
+      });
+    });
+
+    for (const [bucketKey, bucket] of buckets.entries()) {
+      const deltaValue = bucketValueForMetric(bucket, metric);
+      if (deltaValue <= 0 && bucket.messages === 0) continue;
+
+      let entry = merged.get(bucketKey);
+      if (!entry) {
+        const matched = findBaselineEntryForBucket(Array.from(merged.values()), bucket);
+        if (matched) entry = matched;
+      }
+      if (entry) {
+        entry.delta_value = deltaValue;
+        entry.delta_messages = bucket.messages;
+      } else {
+        merged.set(bucketKey, {
+          key: bucketKey,
+          label: bucket.label,
+          sourceLabel: bucket.sourceLabel,
+          mapped: bucket.mapped,
+          baseline_value: 0,
+          baseline_label: '',
+          delta_value: deltaValue,
+          delta_messages: bucket.messages,
+        });
+      }
+    }
+
+    const leaderboard = Array.from(merged.values()).map((entry) => {
+      const finalValue = family.isAdditive
+        ? entry.baseline_value + entry.delta_value
+        : entry.baseline_value || entry.delta_value;
+      const entryHasDelta = entry.delta_value > 0 || entry.delta_messages > 0;
+      return {
+        key: entry.key,
+        label: entry.label,
+        sourceLabel: entry.sourceLabel,
+        mapped: entry.mapped,
+        baseline_value: entry.baseline_value,
+        value: finalValue,
+        value_label: formatMetricValue(finalValue, metric),
+        delta_value: entry.delta_value,
+        delta_label: entryHasDelta && entry.delta_value > 0 ? `+${formatMetricValue(entry.delta_value, metric)}` : '',
+        delta_messages: entry.delta_messages,
+        has_delta: entryHasDelta,
+      };
+    });
+
+    return {
+      metricResult,
+      leaderboard: leaderboard
+        .filter((entry) => Number(entry.value) > 0 || entry.has_delta)
+        .sort((left, right) => (right.value - left.value)
+          || (right.delta_value - left.delta_value)
+          || left.label.localeCompare(right.label))
+        .slice(0, 5),
+    };
+  }
+
+  function computeKikimeterLeaderboard(profile, metric) {
+    return computeBaselinePlusLive(profile, metric).leaderboard;
   }
 
   function renderKikimeter(liveSummary, selectedMetricId) {
@@ -624,6 +854,7 @@
     const metric = liveSummary.selected_metric || getSelectedProfileMetric(metrics, selectedMetricId);
     const leaderboard = Array.isArray(liveSummary.leaderboard) ? liveSummary.leaderboard : [];
     const profileStatus = liveSummary.metric_status || '';
+    const mergedResult = liveSummary.metric_result || metric?.result || null;
 
     if (!metric) {
       return `
@@ -635,6 +866,12 @@
     }
 
     const maxValue = Math.max(...leaderboard.map((entry) => Number(entry.value) || 0), 1);
+    const resultDeltaBadge = mergedResult?.delta_label
+      ? ` <span style="display:inline-block;padding:0 5px;border-radius:8px;background:rgba(113,212,147,.18);color:#71d493;font-weight:700;font-size:10px">${escapeHtml(mergedResult.delta_label)}</span>`
+      : '';
+    const resultLine = mergedResult
+      ? `<div style="margin-bottom:6px;color:#b9a5ae;font-size:11px">RollCodex: <b style="color:#f7edf2">${escapeHtml(mergedResult.label)}</b>${resultDeltaBadge}${mergedResult.count != null ? ` - ${mergedResult.count} ev.` : ''}</div>`
+      : '';
     const buttons = metrics.map((item) => {
       const isSelected = item.id === metric.id;
       return `
@@ -645,6 +882,9 @@
       const value = Number(entry.value) || 0;
       const width = Math.max(8, Math.round((value / maxValue) * 100));
       const title = entry.mapped && entry.sourceLabel !== entry.label ? `${entry.label} (${entry.sourceLabel})` : entry.label;
+      const deltaBadge = entry.delta_label
+        ? ` <span title="Delta session live" style="display:inline-block;padding:0 4px;margin-left:4px;border-radius:6px;background:rgba(113,212,147,.18);color:#71d493;font-weight:700;font-size:10px">${escapeHtml(entry.delta_label)}</span>`
+        : '';
       return `
         <div style="display:grid;grid-template-columns:18px minmax(0,1fr) auto;align-items:center;gap:5px;min-width:0">
           <span style="color:#b9a5ae">#${index + 1}</span>
@@ -652,7 +892,7 @@
             <span style="display:block;width:${width}%;height:100%;min-height:18px;background:rgba(217,42,120,.22)"></span>
             <span style="position:absolute;inset:1px 5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#f7edf2">${escapeHtml(entry.label)}</span>
           </span>
-          <span style="color:#e9bfd0;font-weight:700">${escapeHtml(entry.value_label || value)}</span>
+          <span style="color:#e9bfd0;font-weight:700">${escapeHtml(entry.value_label || value)}${deltaBadge}</span>
         </div>
       `;
     }).join('') : '<div style="color:#b9a5ae">Aucun score visible</div>';
@@ -664,6 +904,7 @@
           <span style="color:#e9bfd0;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(metric.label)}</span>
         </div>
         <div style="display:flex;gap:4px;flex-wrap:wrap;margin-bottom:6px">${buttons}</div>
+        ${resultLine}
         <div style="display:grid;gap:4px;font-size:11px">${rows}</div>
       </div>
     `;
@@ -894,8 +1135,9 @@
     const autoSettings = await getAutoSettings();
     const panelSettings = await getPanelSettings();
     const kikimeterSettings = await getKikimeterSettings();
+    const lastSentKey = await getStorageValue(LAST_SENT_KEY);
     const visibleMessages = getChatRows().map(normalizeChatRow).filter(Boolean);
-    rebuildLiveMetricsFromMessages(visibleMessages);
+    rebuildLiveMetricsFromMessages(getPendingMessagesSlice(visibleMessages, lastSentKey));
     const profile = connection ? await getMappingProfile(connection).catch(() => null) : null;
     renderPanel({
       connection,
@@ -956,7 +1198,8 @@
       local_secret_prefix: connectionSecret.slice(0, 18),
       local_pairing_code: buildPairingCode(state, secretHash),
     });
-    window.open(`${ROLLCODEX_APP_BASE_URL}${ROLLCODEX_CONNECT_PATH}?${params}`, '_blank', 'noopener,noreferrer');
+    const pairingUrl = `${ROLLCODEX_APP_BASE_URL}${ROLLCODEX_CONNECT_PATH}?${params}`;
+    await openRollCodexPairingUrl(pairingUrl);
     updatePanelStatus('Jumelage ouvert dans RollCodex');
   }
 
@@ -1020,13 +1263,18 @@
     };
   }
 
-  async function collectExtensionMessages() {
-    const lastSentKey = await getStorageValue(LAST_SENT_KEY);
-    const messages = getChatRows().map(normalizeChatRow).filter(Boolean);
-    rebuildLiveMetricsFromMessages(messages);
+  function getPendingMessagesSlice(messages, lastSentKey) {
     if (!lastSentKey) return messages;
     const lastIndex = messages.findIndex((message) => message.key === lastSentKey);
     return lastIndex >= 0 ? messages.slice(lastIndex + 1) : messages;
+  }
+
+  async function collectExtensionMessages() {
+    const lastSentKey = await getStorageValue(LAST_SENT_KEY);
+    const messages = getChatRows().map(normalizeChatRow).filter(Boolean);
+    const pending = getPendingMessagesSlice(messages, lastSentKey);
+    rebuildLiveMetricsFromMessages(pending);
+    return pending;
   }
 
   function recordLiveMetricsFromMessages(messages) {
@@ -1082,13 +1330,14 @@
       .slice(0, 5);
     const profileMetrics = getProfileMetrics(profile);
     const selectedMetric = getSelectedProfileMetric(profileMetrics, selectedMetricId);
-    const leaderboard = computeKikimeterLeaderboard(profile, selectedMetric);
+    const merged = computeBaselinePlusLive(profile, selectedMetric);
     return {
       totals: { ...liveMetricsState.totals },
       top_participants: topParticipants,
       profile_metrics: profileMetrics,
       selected_metric: selectedMetric,
-      leaderboard,
+      leaderboard: merged.leaderboard,
+      metric_result: merged.metricResult,
       metric_status: getMetricProfileStatus(profile, connection),
       recent_events: liveMetricsState.recentEvents.slice(0, LIVE_RECENT_EVENTS_LIMIT),
     };
@@ -1151,6 +1400,8 @@
 
     const profile = response.payload?.profile || null;
     if (profile) {
+      const previousLastUpdate = stored?.profile?.last_updated_at || null;
+      const nextLastUpdate = profile.last_updated_at || null;
       await setStorageValues({
         [MAPPING_PROFILE_KEY]: {
           connection_id: connection.connection_id,
@@ -1158,6 +1409,13 @@
           profile,
         },
       });
+      if (previousLastUpdate && nextLastUpdate && previousLastUpdate !== nextLastUpdate) {
+        // RollCodex a absorbe / l'utilisateur a re-mappe : la baseline englobe maintenant
+        // une partie de ce qui etait en live. Le filtrage par LAST_SENT_KEY assure
+        // qu'on ne double-compte pas, mais on reconstruit l'etat live pour eviter
+        // de garder des contributions obsoletes.
+        resetLiveMetricsState();
+      }
     }
     return profile;
   }
@@ -1408,7 +1666,7 @@
     observer.observe(document.body, { childList: true, subtree: true });
   }
 
-  chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+  getExtensionApi()?.runtime?.onMessage?.addListener((message, _sender, sendResponse) => {
     if (message?.type === MESSAGE_EXTENSION_CONNECTED) {
       refreshPanel('Connexion RollCodex active');
       if (message.connection) {

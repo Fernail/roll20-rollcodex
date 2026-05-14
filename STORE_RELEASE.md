@@ -11,14 +11,14 @@ Cette URL est publique et peut etre exposee dans le bundle Vite. Elle sert au bo
 ## Avant une release
 
 - Verifier que `manifest.json` porte la bonne version.
-- Generer puis charger le canal local : `./scripts/package-extension.ps1 -Channel dev -OutputDirectory dist`.
-- Charger uniquement `dist/unpacked-dev` dans Chrome et tester une table Roll20 contre `localhost:5173`.
+- Generer puis charger le canal local cible : `./scripts/package-extension.ps1 -Channel dev -OutputDirectory dist`, `./scripts/package-extension.ps1 -Channel firefox-dev -OutputDirectory dist` ou `./scripts/package-extension.ps1 -Channel safari-dev -OutputDirectory dist`.
+- Charger uniquement la variante locale correspondante dans le navigateur cible et tester une table Roll20 contre `localhost:5173`.
 - Quand le test local est valide, publier avec `scripts/auto-push --roll20-webstore-release` depuis le depot RollCodex racine, ou creer un tag Git correspondant, par exemple `v0.3.3`, puis le pousser sur GitHub.
 - Laisser GitHub Actions construire, verifier, uploader et soumettre le paquet Web Store.
 
 Le depot manuel du zip dans le Chrome Web Store Developer Dashboard reste un fallback d'urgence. La voie normale passe par `.github/workflows/chrome-webstore-release.yml`.
 
-Le canal `store` nettoie le paquet avant zip : l'extension ouvre `https://rollcodex.app`, retire les hosts locaux et ne garde que `https://rollcodex.app/*`, `https://app.roll20.net/*` et `https://*.supabase.co/*`. Le canal `dev` garde les hosts locaux pour les tests non empaquetes. Le script garde un seul dossier non empaquete a la fois : `unpacked-dev` ou `unpacked-store`, jamais les deux simultanement.
+Les canaux `store`, `firefox-store` et `safari-store` nettoient le paquet avant zip : l'extension ouvre `https://rollcodex.app`, retire les hosts locaux et ne garde que `https://rollcodex.app/*`, `https://app.roll20.net/*` et `https://*.supabase.co/*`. Les canaux `dev`, `firefox-dev` et `safari-dev` gardent les hosts locaux pour les tests non empaquetes. Ne chargez pas deux variantes RollCodex Roll20 dans le meme navigateur en meme temps.
 
 ## Mise a jour automatisee depuis GitHub Actions
 

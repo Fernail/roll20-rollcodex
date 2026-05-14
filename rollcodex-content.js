@@ -36,6 +36,61 @@
     });
   }
 
+  function getExtensionApi() {
+    return globalThis.chrome || globalThis.browser || null;
+  }
+
+  function readRuntimeLastError() {
+    return getExtensionApi()?.runtime?.lastError || null;
+  }
+
+  function callExtensionMethod(method, args, onSuccess, onError) {
+    let settled = false;
+    const resolveOnce = (handler, ...handlerArgs) => {
+      if (settled) return;
+      settled = true;
+      handler(...handlerArgs);
+    };
+    const callback = (...callbackArgs) => {
+      const runtimeError = readRuntimeLastError();
+      if (runtimeError) resolveOnce(onError, runtimeError);
+      else resolveOnce(onSuccess, ...callbackArgs);
+    };
+
+    try {
+      const maybePromise = method(...args, callback);
+      if (maybePromise && typeof maybePromise.then === 'function') {
+        maybePromise.then((result) => resolveOnce(onSuccess, result)).catch((error) => resolveOnce(onError, error));
+      }
+    } catch (callbackError) {
+      try {
+        const maybePromise = method(...args);
+        if (maybePromise && typeof maybePromise.then === 'function') {
+          maybePromise.then((result) => resolveOnce(onSuccess, result)).catch((error) => resolveOnce(onError, error));
+          return;
+        }
+      } catch (promiseError) {
+        resolveOnce(onError, promiseError);
+        return;
+      }
+      resolveOnce(onError, callbackError);
+    }
+  }
+
+  function sendRuntimeMessage(message, reply) {
+    const runtime = getExtensionApi()?.runtime;
+    if (!runtime?.sendMessage) {
+      reply({ ok: false, error: 'Extension API unavailable.' });
+      return;
+    }
+    callExtensionMethod(
+      runtime.sendMessage.bind(runtime),
+      [message],
+      (response) => reply(response || { ok: false, error: 'Aucune reponse du bridge Roll20.' }),
+      (error) => reply({ ok: false, error: error?.message || String(error || 'Extension API unavailable.') }),
+    );
+  }
+
   window.addEventListener('message', (event) => {
     if (event.source !== window) return;
     const message = event.data || {};
@@ -47,33 +102,21 @@
     }
 
     if (message.type === MESSAGE_SYNC_CONNECTION) {
-      chrome.runtime.sendMessage({
+      sendRuntimeMessage({
         type: MESSAGE_SYNC_CONNECTION,
         requestId: message.requestId,
         connection: message.connection || {},
-      }, (response) => {
-        if (chrome.runtime.lastError) {
-          replySyncConnectionResult(message.requestId, { ok: false, error: chrome.runtime.lastError.message });
-          return;
-        }
-        replySyncConnectionResult(message.requestId, response);
-      });
+      }, (response) => replySyncConnectionResult(message.requestId, response));
       return;
     }
 
     if (message.type !== MESSAGE_CONFIRM) return;
-    chrome.runtime.sendMessage({
+    sendRuntimeMessage({
       type: MESSAGE_CONFIRM,
       requestId: message.requestId,
       command: message.command,
       context: message.context || {},
-    }, (response) => {
-      if (chrome.runtime.lastError) {
-        replyConfirmResult(message.requestId, { ok: false, error: chrome.runtime.lastError.message });
-        return;
-      }
-      replyConfirmResult(message.requestId, response);
-    });
+    }, (response) => replyConfirmResult(message.requestId, response));
   });
 
   replyReady();
