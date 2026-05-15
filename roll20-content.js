@@ -1,3 +1,30 @@
+// Récupère le nom du GM courant depuis l'UI Roll20 (fallback sur 'GM')
+function getCurrentGmName() {
+  // Cherche le nom affiché dans la barre Roll20 (avatar en haut à droite)
+  const userNode = document.querySelector('#user-menu .user-name, #user-menu .display-name, .user-menu .user-name, .user-menu .display-name');
+  const name = userNode ? normalizeText(userNode.textContent) : '';
+  if (name && name.length > 1 && name.length < 40) return name;
+  // Fallback sur le nom du premier joueur actif GM dans la liste
+  const gmNode = document.querySelector('.player[data-is_gm="true"] .player-name, .player[data-is_gm="true"] .display-name');
+  const gmName = gmNode ? normalizeText(gmNode.textContent) : '';
+  if (gmName && gmName.length > 1 && gmName.length < 40) return gmName;
+  return 'GM';
+}
+// Détecte si un speaker est un NPC/monstre (ni GM, ni joueur)
+function isNpcOrMonsterSpeakerLabel(speaker) {
+  const s = normalizeText(speaker).toLowerCase();
+  if (!s || isGmSpeakerLabel(s) || /to gm/i.test(s)) return false;
+  // Heuristique : si ce n'est pas GM, ni un nom de joueur connu, ni vide, on considère NPC/monstre
+  // (optionnel : affiner avec une liste de joueurs connus si dispo)
+  // On exclut les speakers vides ou génériques
+  if (s === 'roll20' || s === 'system' || s === 'api') return false;
+  // Si le nom contient "npc", "monstre", "monster", "ennemi", etc.
+  if (/npc|monstre|monster|ennemi|enemy|creature|bestiol|hostile/.test(s)) return true;
+  // Si le nom ne ressemble pas à un prénom ou pseudo joueur (simple heuristique)
+  if (/gobelin|orc|dragon|zombie|squelette|bandit|cultiste|rat|chien|wolf|golem|démon|demon|sorcière|witch|beholder|troll|ogre|vampire|lich|spectre|wraith|slime|gelée|blob|elemental|géant|giant|spider|araignée|kobold|gnoll|worg|wight|mimic|basilic|chimère|hydre|hydra|griffon|griffin|wyverne|wyvern|harpie|harpy|goule|ghoul|sahuagin|aboleth|myconide|myconid|drow|elfe noir|hobgobelin|hobgoblin|gnome|nain|dwarf|elfe|elf|humain|human|ogre|troll|tarrasque|rakshasa|rakshaza|rakshasa|rakshaza/.test(s)) return true;
+  // Par défaut, si ce n'est pas GM, on considère NPC/monstre
+  return true;
+}
 (() => {
   const MESSAGE_SEND_CHAT_COMMAND = 'ROLLCODEX_ROLL20_SEND_CHAT_COMMAND';
   const MESSAGE_SEND_SNAPSHOT = 'ROLLCODEX_ROLL20_SEND_SNAPSHOT';
@@ -20,6 +47,22 @@
   const KIKIMETER_SETTINGS_KEY = 'rollcodexExtensionKikimeterSettings';
   const PANEL_ID = 'rollcodex-extension-panel';
   const PANEL_POSITIONS = ['bottom-left', 'top-left', 'bottom-right', 'manual'];
+  const PANEL_COLORS = {
+    bg: 'rgba(17,13,12,.96)',
+    bgSoft: 'rgba(24,18,17,.72)',
+    bgCollapsed: 'rgba(17,13,12,.52)',
+    border: '#c79a4b',
+    borderSoft: 'rgba(199,154,75,.24)',
+    text: '#f4ede3',
+    muted: '#b4a696',
+    faint: '#7e7063',
+    accent: '#d7ad5c',
+    accentSoft: 'rgba(215,173,92,.2)',
+    rose: '#9d3a68',
+    roseSoft: 'rgba(157,58,104,.24)',
+    ok: '#78c88f',
+    danger: '#d96a6a',
+  };
   const MAX_EXTENSION_MESSAGES = 120;
   const LIVE_RECENT_EVENTS_LIMIT = 6;
   const DEFAULT_AUTO_IDLE_MS = 45 * 60000;
@@ -132,12 +175,91 @@
     return d20Match ? Number(d20Match[1]) : null;
   }
 
+  function inferLiveActionType(rawText, { damageTotal = null, healTotal = null, hasRoll = false } = {}) {
+    const text = normalizeText(rawText);
+    const hasSpell = /\b(?:spell|sort|sortilege|cantrip)\b/i.test(text);
+    const hasDamage = damageTotal != null || /\b(?:damage|dmg|degats)\b/i.test(text);
+    const hasHealing = healTotal != null || /\b(?:heal|healing|soin|soins|soigne)\b/i.test(text);
+    const hasInitiative = /\binitiative\b/i.test(text);
+    const hasSavingThrow = /\b(?:saving\s*throw|sauvegarde|save|dex\s*save|str\s*save|con\s*save|int\s*save|wis\s*save|cha\s*save|fortitude|reflex|will)\b/i.test(text);
+    const hasSkillCheck = /\b(?:skill\s*check|ability\s*check|competence|acrobatics|athletics|arcana|history|investigation|nature|religion|insight|medicine|perception|survival|deception|intimidation|performance|persuasion|stealth|sleight\s*of\s*hand)\b/i.test(text);
+    const hasAttackCue = /\b(?:attack|attaque|to\s*hit|toucher|hit\s*roll|jet\s*d\s*attaque)\b/i.test(text);
+
+    // Certaines cartes Roll20 combinent "attaque" et "degats" dans le meme bloc.
+    // Pour le kikimeter, on privilegie le type attaque quand un jet d20 d'attaque est present.
+    if (hasAttackCue && hasRoll) return hasSpell ? 'spell_attack' : 'attack';
+    if (hasDamage) return hasSpell ? 'spell_damage' : 'damage';
+    if (hasHealing) return 'healing';
+    if (hasInitiative) return 'initiative';
+    if (hasSavingThrow) return 'saving_throw';
+    if (hasSkillCheck) return 'skill_check';
+    if (hasAttackCue) return hasSpell ? 'spell_attack' : 'attack';
+    if (hasRoll) return 'roll';
+    return hasSpell ? 'spell' : 'message';
+  }
+
+  function inferStandaloneRollTotal(rawText, actionType) {
+    if (!LIVE_ROLL_EVENT_TYPES.has(actionType) && actionType !== 'roll') return null;
+    const numbers = Array.from(String(rawText || '').matchAll(/\b(\d{1,3})\b/g))
+      .map((match) => Number(match[1]))
+      .filter((number) => number >= 1 && number <= 60);
+    return numbers.length ? numbers[numbers.length - 1] : null;
+  }
+
+  function inferActionNameHint(rawText, actionType) {
+    const text = normalizeText(rawText);
+    const patterns = [
+      ['Shortbow', /\bshortbow\b/i],
+      ['Longbow', /\blongbow\b/i],
+      ['Crossbow', /\bcrossbow\b/i],
+      ['Longsword', /\blongsword\b/i],
+      ['Shortsword', /\bshortsword\b/i],
+      ['Greataxe', /\bgreataxe\b/i],
+      ['Shield Bash', /\bshield\s*bash\b/i],
+      ['Rapier', /\brapier\b/i],
+      ['Dagger', /\bdagger\b/i],
+      ['Sword', /\bsword\b/i],
+      ['Axe', /\baxe\b/i],
+      ['Mace', /\bmace\b/i],
+      ['Initiative', /\binitiative\b/i],
+      ['Perception', /\bperception\b/i],
+      ['Stealth', /\bstealth\b/i],
+      ['Dex Save', /\b(?:dex\s*save|dexterity\s*save)\b/i],
+      ['Con Save', /\b(?:con\s*save|constitution\s*save)\b/i],
+      ['Wis Save', /\b(?:wis\s*save|wisdom\s*save)\b/i],
+    ];
+    const match = patterns.find(([, pattern]) => pattern.test(text));
+    if (match) return match[0];
+    if (actionType === 'attack' || actionType === 'spell_attack') return 'Attack';
+    if (actionType === 'damage' || actionType === 'spell_damage') return 'Damage';
+    if (actionType === 'healing') return 'Healing';
+    return '';
+  }
+
+  function inferSubTypeHint(rawText, actionType) {
+    const text = normalizeText(rawText);
+    if (actionType === 'attack') {
+      if (/\b(?:shortbow|longbow|crossbow|bow|ranged|distance)\b/i.test(text)) return 'ranged';
+      if (/\b(?:dagger|rapier|sword|axe|mace|greataxe|longsword|shortsword|melee|contact)\b/i.test(text)) return 'melee';
+    }
+    if (actionType === 'saving_throw') {
+      const match = text.match(/\b(dexterity|strength|constitution|intelligence|wisdom|charisma|fortitude|reflex|will|dex|str|con|int|wis|cha)\b/i);
+      return match ? match[1].toLowerCase() : '';
+    }
+    return '';
+  }
+
+  function inferSkillNameHint(rawText, actionType) {
+    if (actionType !== 'skill_check') return '';
+    const text = normalizeText(rawText);
+    const match = text.match(/\b(acrobatics|athletics|arcana|history|investigation|nature|religion|insight|medicine|perception|survival|deception|intimidation|performance|persuasion|stealth|sleight\s*of\s*hand)\b/i);
+    return match ? normalizeText(match[1]) : '';
+  }
+
   function extractRollFigures(rawText) {
     const text = normalizeText(rawText);
-    const lower = text.toLowerCase();
     const rollNatural = inferRollNatural(text);
     const totalMatch = text.match(/\b(?:total|result|resultat)\D{0,12}(\d{1,3})\b/i);
-    const rollTotal = toSafeNumber(totalMatch?.[1]);
     const damageTotal = inferAmountFromText(text, [
       /\b(?:damage|dmg|degats)\D{0,16}(\d{1,4})\b/i,
       /\b(\d{1,4})\s*(?:damage|dmg|degats)\b/i,
@@ -146,19 +268,19 @@
       /\b(?:heal|healing|soin|soins|soigne)\D{0,16}(\d{1,4})\b/i,
       /\b(\d{1,4})\s*(?:heal|healing|soin|soins)\b/i,
     ]);
-    const hasRoll = /\b(?:d20|1d20|jet|roll|resultat|total)\b/i.test(text) || rollNatural != null || rollTotal != null;
-    const actionType = damageTotal != null ? 'damage'
-      : healTotal != null ? 'healing'
-        : hasRoll ? 'roll'
-          : lower.includes('spell') || lower.includes('sort') ? 'spell'
-            : lower.includes('attack') || lower.includes('attaque') ? 'attack'
-              : 'message';
+    const explicitRollTotal = toSafeNumber(totalMatch?.[1]);
+    const hasRoll = /\b(?:d20|1d20|jet|roll|resultat|total)\b/i.test(text) || rollNatural != null || explicitRollTotal != null;
+    const actionType = inferLiveActionType(text, { damageTotal, healTotal, hasRoll });
+    const rollTotal = explicitRollTotal ?? inferStandaloneRollTotal(text, actionType);
     return {
       actionType,
       rollNatural,
       rollTotal,
       damageTotal,
       healTotal,
+      actionName: inferActionNameHint(text, actionType),
+      subType: inferSubTypeHint(text, actionType),
+      skillName: inferSkillNameHint(text, actionType),
       isCritical: rollNatural === 20 || /\b(?:critical|critique)\b/i.test(text),
       isFumble: rollNatural === 1 || /\b(?:fumble|echec critique)\b/i.test(text),
       hasRoll,
@@ -174,7 +296,30 @@
     return speaker;
   }
 
-  function getChatSpeaker(node, rawText) {
+  function normalizeSpeakerLabel(value) {
+    return normalizeText(value).replace(/\s*:\s*$/g, '');
+  }
+
+  function isRoll20SpeakerCandidate(value) {
+    const label = normalizeSpeakerLabel(value);
+    if (!label || label.length < 2 || label.length > 64) return false;
+    if (/^[+\-]?\d+(?:[.,]\d+)?$/.test(label)) return false;
+    if (/\b(?:d\d+|\d+d\d+|roll|rolling|jet|total|result|resultat|damage|dmg|degats|heal|healing|soin|soins|details?|advantage|disadvantage|normal|vex|attack|attaque|shortbow|longbow|crossbow|dagger|rapier|sword|axe|mace|spell|sort|initiative|saving|save|skill)\b/i.test(label)) return false;
+    return true;
+  }
+
+  function getTextSegments(node) {
+    return String(node?.innerText || node?.textContent || '')
+      .split(/\n+/)
+      .map(normalizeSpeakerLabel)
+      .filter(Boolean);
+  }
+
+  function isGmSpeakerLabel(value) {
+    return /\b(?:gm|mj|game\s*master|maitre\s*du\s*jeu|maître\s*du\s*jeu|dungeon\s*master|dm)\b/i.test(normalizeSpeakerLabel(value));
+  }
+
+  function getChatSender(node) {
     const selectors = [
       '[data-speaker]',
       '[data-sender]',
@@ -187,10 +332,50 @@
     ];
     for (const selector of selectors) {
       const match = node.querySelector?.(selector);
-      const value = normalizeText(match?.getAttribute?.('data-speaker') || match?.getAttribute?.('data-sender') || match?.textContent);
+      const value = normalizeSpeakerLabel(match?.getAttribute?.('data-speaker') || match?.getAttribute?.('data-sender') || match?.textContent);
       if (value && value.length <= 64) return value;
     }
-    return getSpeakerFromText(rawText) || 'Roll20';
+    return '';
+  }
+
+  function getRollCardSpeaker(node, rawText) {
+    const selectors = [
+      '[data-character-name]',
+      '[data-actor-name]',
+      '[data-roll-character]',
+      '.sheet-character-name',
+      '.sheet-charname',
+      '.rolltemplate-character-name',
+      '[class*="character-name" i]',
+      '[class*="charname" i]',
+      '[class*="actor-name" i]',
+      '[class*="rolltemplate" i] [class*="character" i]',
+      '[class*="rolltemplate" i] [class*="name" i]',
+    ];
+    for (const selector of selectors) {
+      const match = node.querySelector?.(selector);
+      const value = normalizeSpeakerLabel(match?.getAttribute?.('data-character-name')
+        || match?.getAttribute?.('data-actor-name')
+        || match?.getAttribute?.('data-roll-character')
+        || match?.textContent);
+      if (isRoll20SpeakerCandidate(value)) return value;
+    }
+
+    const segments = getTextSegments(node);
+    const firstSegmentSpeaker = getSpeakerFromText(segments[0] || rawText);
+    const candidates = firstSegmentSpeaker ? segments.slice(1, 5) : segments.slice(0, 4);
+    return candidates.find(isRoll20SpeakerCandidate) || '';
+  }
+
+  function getChatSpeaker(node, rawText) {
+    const sender = getChatSender(node);
+    if (isGmSpeakerLabel(sender)) return sender;
+
+    const rollCardSpeaker = getRollCardSpeaker(node, rawText);
+    if (rollCardSpeaker) return rollCardSpeaker;
+
+    if (sender) return sender;
+    return normalizeSpeakerLabel(getSpeakerFromText(rawText)) || 'Roll20';
   }
 
   function getChatRowKey(node, index, rawText) {
@@ -407,18 +592,20 @@
       'position:fixed',
       ...getPanelPositionStyles(settings),
       'z-index:99999',
-      `width:${collapsed ? '208px' : '292px'}`,
+      `width:${collapsed ? '330px' : '560px'}`,
       'max-width:calc(100vw - 92px)',
-      'max-height:min(58vh, 420px)',
-      `padding:${collapsed ? '8px 10px' : '10px'}`,
+      `max-height:${collapsed ? 'min(36vh, 210px)' : 'min(52vh, 300px)'}`,
+      `padding:${collapsed ? '9px 10px' : '9px'}`,
       'box-sizing:border-box',
       'overflow:auto',
-      'border:1px solid #a22d65',
+      `border:1px solid ${PANEL_COLORS.border}`,
       'border-radius:8px',
-      'background:rgba(22,16,19,.96)',
-      'color:#f7edf2',
+      `background:${collapsed ? PANEL_COLORS.bgCollapsed : PANEL_COLORS.bg}`,
+      `color:${PANEL_COLORS.text}`,
       'font:12px/1.4 Arial,sans-serif',
-      'box-shadow:0 12px 34px rgba(0,0,0,.38)',
+      `box-shadow:${collapsed ? '0 8px 22px rgba(0,0,0,.2)' : '0 12px 34px rgba(0,0,0,.38)'}`,
+      collapsed ? 'backdrop-filter:saturate(120%) blur(2px)' : '',
+      collapsed ? 'cursor:grab' : '',
     ].join(';');
   }
 
@@ -489,10 +676,70 @@
   function renderConnectionTarget(connection) {
     return getConnectionTargetRows(connection).map((row) => `
       <div style="display:flex;gap:5px;min-width:0;line-height:1.35">
-        <span style="color:#b9a5ae;flex:0 0 auto">${escapeHtml(row.label)}:</span>
-        <span style="color:#e9bfd0;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(row.value)}</span>
+        <span style="color:${PANEL_COLORS.muted};flex:0 0 auto">${escapeHtml(row.label)}:</span>
+        <span style="color:${PANEL_COLORS.accent};min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(row.value)}</span>
       </div>
     `).join('');
+  }
+
+  function renderCompactConnectionTarget(connection) {
+    const rows = connection ? getConnectionTargetRows(connection) : [];
+    if (!rows.length) return escapeHtml('Pret pour jumelage');
+    const table = rows.find((row) => row.label === 'Table')?.value;
+    const campaign = rows.find((row) => row.label === 'Campagne')?.value;
+    return escapeHtml([table, campaign].filter(Boolean).join(' / ') || rows[0].value);
+  }
+
+  function panelButtonStyle(variant = 'secondary') {
+    const variants = {
+      primary: {
+        bg: `linear-gradient(180deg,${PANEL_COLORS.accent},#a97832)`,
+        color: '#160f0d',
+        border: 'rgba(255,255,255,.16)',
+      },
+      purple: {
+        bg: 'linear-gradient(180deg,#6e5587,#4a3a62)',
+        color: PANEL_COLORS.text,
+        border: 'rgba(255,255,255,.14)',
+      },
+      green: {
+        bg: 'linear-gradient(180deg,#3f7a58,#245f43)',
+        color: PANEL_COLORS.text,
+        border: 'rgba(255,255,255,.14)',
+      },
+      brown: {
+        bg: 'linear-gradient(180deg,#6d4a32,#4a3326)',
+        color: PANEL_COLORS.text,
+        border: PANEL_COLORS.borderSoft,
+      },
+      secondary: {
+        bg: `linear-gradient(180deg,${PANEL_COLORS.bgSoft},rgba(255,255,255,.035))`,
+        color: PANEL_COLORS.text,
+        border: PANEL_COLORS.borderSoft,
+      },
+    };
+    const style = variants[variant] || variants.secondary;
+    return [
+      'cursor:pointer',
+      `background:${style.bg}`,
+      `color:${style.color}`,
+      `border:1px solid ${style.border}`,
+      'border-radius:7px',
+      'min-height:22px',
+      'padding:2px 7px',
+      'font-weight:700',
+      'font-size:10px',
+      'line-height:1.1',
+      'box-shadow:inset 0 1px 0 rgba(255,255,255,.06),0 3px 8px rgba(0,0,0,.14)',
+    ].join(';');
+  }
+
+  function compactPanelStatus(status, connection) {
+    const text = normalizeText(status);
+    if (!connection) return text || 'Non connecte';
+    if (!text || /^panneau\b/i.test(text) || /^connecte via extension$/i.test(text)) return 'Connecte';
+    if (/kikimeter|profil|mapping/i.test(text)) return 'Synchro';
+    return text;
   }
 
   function normalizeProfileMetricResult(result) {
@@ -508,17 +755,28 @@
     };
   }
 
+  function buildMetricTargetKey(targetKind, targetId) {
+    const normalizedId = normalizeText(targetId);
+    if (!normalizedId) return '';
+    const normalizedKind = normalizeText(targetKind || 'target').toLowerCase() || 'target';
+    return `${normalizedKind}:${normalizedId}`;
+  }
+
   function normalizeProfileMetricRankingEntry(entry, index) {
     if (!entry || typeof entry !== 'object') return null;
     const value = toSafeNumber(entry.value);
     const label = normalizeText(entry.label || entry.target_label || entry.name);
     if (value == null || !label) return null;
     const valueLabel = normalizeText(entry.value_label || entry.valueLabel || entry.label_value);
+    const targetKind = normalizeText(entry.target_kind || entry.targetKind || entry.type || 'character').toLowerCase();
+    const targetId = normalizeText(entry.target_id || entry.targetId || entry.id);
     return {
-      key: normalizeText(entry.id || entry.key || `ranking-${index}`),
+      key: targetId ? buildMetricTargetKey(targetKind, targetId) : normalizeText(entry.key || `ranking-${index}`),
       label,
       sourceLabel: normalizeText(entry.source_label || entry.sourceLabel || entry.detail || label),
       mapped: true,
+      target_kind: targetKind,
+      target_id: targetId,
       value,
       value_label: valueLabel || String(value),
       count: toSafeNumber(entry.count),
@@ -542,6 +800,9 @@
       filterEventType: Array.isArray(metric?.filter_event_type)
         ? metric.filter_event_type.map((item) => normalizeText(item).toLowerCase()).filter(Boolean)
         : [],
+      filterSubType: normalizeText(metric?.filter_sub_type).toLowerCase(),
+      filterSkillName: normalizeText(metric?.filter_skill_name).toLowerCase(),
+      filterActionName: normalizeText(metric?.filter_action_name).toLowerCase(),
       sortOrder: Number(metric?.sort_order) || 0,
       result: normalizeProfileMetricResult(metric?.result),
       ranking,
@@ -590,15 +851,43 @@
 
   function messageMatchesMetricFilter(message, metric) {
     const filters = metric.filterEventType || [];
-    if (!filters.length) return true;
     const actionType = normalizeText(message?.action_type_hint || 'message').toLowerCase();
-    return filters.some((filter) => {
+    const matchesEventType = !filters.length || filters.some((filter) => {
       if (filter === actionType) return true;
-      if (LIVE_DAMAGE_EVENT_TYPES.has(filter)) return message?.damage_total_hint != null || LIVE_DAMAGE_EVENT_TYPES.has(actionType);
-      if (LIVE_HEALING_EVENT_TYPES.has(filter)) return message?.heal_total_hint != null || LIVE_HEALING_EVENT_TYPES.has(actionType);
-      if (LIVE_ROLL_EVENT_TYPES.has(filter)) return isRollLikeMessage(message);
+      if (LIVE_DAMAGE_EVENT_TYPES.has(filter)) {
+        // Evite qu'une attaque avec bloc "damage" soit comptee aussi en degats.
+        // On accepte le fallback par hint seulement pour les lignes non typables.
+        return LIVE_DAMAGE_EVENT_TYPES.has(actionType)
+          || ((actionType === 'message' || actionType === 'roll') && message?.damage_total_hint != null);
+      }
+      if (LIVE_HEALING_EVENT_TYPES.has(filter)) {
+        return LIVE_HEALING_EVENT_TYPES.has(actionType)
+          || ((actionType === 'message' || actionType === 'roll') && message?.heal_total_hint != null);
+      }
+      if (filter === 'roll') return isRollLikeMessage(message);
       return false;
     });
+    if (!matchesEventType) return false;
+
+    const metricSubType = normalizeText(metric.filterSubType).toLowerCase();
+    if (metricSubType) {
+      const messageSubType = normalizeText(message?.sub_type_hint).toLowerCase();
+      if (messageSubType !== metricSubType) return false;
+    }
+
+    const metricSkillName = normalizeText(metric.filterSkillName).toLowerCase();
+    if (metricSkillName) {
+      const messageSkillName = normalizeText(message?.skill_name_hint).toLowerCase();
+      if (messageSkillName !== metricSkillName) return false;
+    }
+
+    const metricActionName = normalizeText(metric.filterActionName).toLowerCase();
+    if (metricActionName) {
+      const actionName = normalizeText(message?.action_name_hint).toLowerCase();
+      if (!actionName || !actionName.includes(metricActionName)) return false;
+    }
+
+    return true;
   }
 
   function getMetricFieldValue(message, field) {
@@ -620,20 +909,51 @@
     return value === expected;
   }
 
+  function getSpeakerLookupKeys(speaker) {
+    const normalized = normalizeSpeakerLabel(speaker);
+    const withoutGmSuffix = normalized.replace(/\s*\((?:gm|mj)\)\s*$/i, '');
+    return Array.from(new Set([normalized, withoutGmSuffix].map(normalizeMappingKey).filter(Boolean)));
+  }
+
   function resolveSpeakerMapping(profile, speaker) {
-    const sourceKey = normalizeMappingKey(speaker);
+    const sourceKeys = new Set(getSpeakerLookupKeys(speaker));
     const mappings = Array.isArray(profile?.mappings) ? profile.mappings : [];
-    return mappings.find((mapping) => mapping?.source_kind === 'speaker' && normalizeMappingKey(mapping.source_key || mapping.source_label) === sourceKey) || null;
+    return mappings.find((mapping) => {
+      if (mapping?.source_kind !== 'speaker') return false;
+      return sourceKeys.has(normalizeMappingKey(mapping.source_key || mapping.source_label))
+        || sourceKeys.has(normalizeMappingKey(mapping.target_label));
+    }) || null;
+  }
+
+  function resolveSpeakerMappingFromText(profile, rawText) {
+    const textKey = normalizeMappingKey(String(rawText || '').slice(0, 180));
+    if (!textKey) return null;
+    const mappings = Array.isArray(profile?.mappings) ? profile.mappings : [];
+    const candidates = mappings
+      .filter((mapping) => mapping?.source_kind === 'speaker')
+      .flatMap((mapping) => [mapping.source_label, mapping.target_label]
+        .map((label) => ({ mapping, labelKey: normalizeMappingKey(label) }))
+        .filter((candidate) => candidate.labelKey && candidate.labelKey.length >= 3)
+        .map((candidate) => ({
+          ...candidate,
+          index: textKey.indexOf(candidate.labelKey),
+          isCharacter: normalizeText(mapping.target_kind).toLowerCase() === 'character',
+        })))
+      .filter((candidate) => candidate.index >= 0 && candidate.index <= 90)
+      .sort((left, right) => left.index - right.index
+        || Number(right.isCharacter) - Number(left.isCharacter)
+        || right.labelKey.length - left.labelKey.length);
+    return candidates[0]?.mapping || null;
   }
 
   function getMetricBucket(profile, message) {
-    const speaker = normalizeText(message?.speaker) || 'Roll20';
-    const mapping = resolveSpeakerMapping(profile, speaker);
+    const speaker = normalizeSpeakerLabel(message?.speaker) || 'Roll20';
+    const mapping = resolveSpeakerMapping(profile, speaker) || resolveSpeakerMappingFromText(profile, message?.raw_text);
     const targetId = normalizeText(mapping?.target_id);
     const targetKind = normalizeText(mapping?.target_kind);
     const label = normalizeText(mapping?.target_label) || speaker;
     return {
-      key: targetId ? `${targetKind || 'target'}:${targetId}` : `speaker:${normalizeMappingKey(speaker)}`,
+      key: targetId ? buildMetricTargetKey(targetKind || 'target', targetId) : `speaker:${normalizeMappingKey(speaker)}`,
       label,
       sourceLabel: speaker,
       mapped: Boolean(targetId),
@@ -643,39 +963,40 @@
   function addMetricContribution(bucket, metric, message) {
     const aggregation = metric.aggregation || 'count';
     if (aggregation === 'percent_critical') {
-      if (!isRollLikeMessage(message)) return;
+      if (!isRollLikeMessage(message)) return false;
       bucket.denominator += 1;
       if (message.roll_natural_hint === 20) bucket.numerator += 1;
-      return;
+      return true;
     }
     if (aggregation === 'percent_fumble') {
-      if (!isRollLikeMessage(message)) return;
+      if (!isRollLikeMessage(message)) return false;
       bucket.denominator += 1;
       if (message.roll_natural_hint === 1) bucket.numerator += 1;
-      return;
+      return true;
     }
     if (aggregation === 'percent') {
       const value = getMetricFieldValue(message, metric.percentField || metric.field);
-      if (value == null) return;
+      if (value == null) return false;
       bucket.denominator += 1;
       if (compareMetricPercent(value, metric)) bucket.numerator += 1;
-      return;
+      return true;
     }
     if (aggregation === 'avg' || aggregation === 'average' || aggregation === 'mean') {
       const value = getMetricFieldValue(message, metric.field);
-      if (value == null) return;
+      if (value == null) return false;
       bucket.sum += value;
       bucket.count += 1;
-      return;
+      return true;
     }
     if (aggregation === 'sum') {
       const value = getMetricFieldValue(message, metric.field);
-      if (value == null) return;
+      if (value == null) return false;
       bucket.sum += value;
       bucket.count += 1;
-      return;
+      return true;
     }
     bucket.count += 1;
+    return true;
   }
 
   function formatMetricValue(value, metric) {
@@ -725,8 +1046,9 @@
         messages: 0,
       };
       const before = { count: bucket.count, sum: bucket.sum, numerator: bucket.numerator, denominator: bucket.denominator };
+      const contributed = addMetricContribution(bucket, metric, message);
+      if (!contributed) return;
       bucket.messages += 1;
-      addMetricContribution(bucket, metric, message);
       totals.messages += 1;
       totals.count += bucket.count - before.count;
       totals.sum += bucket.sum - before.sum;
@@ -849,6 +1171,35 @@
     return computeBaselinePlusLive(profile, metric).leaderboard;
   }
 
+  function renderKikimeterRows(leaderboard, metric, { compact = false, limit = 5 } = {}) {
+    const entries = (Array.isArray(leaderboard) ? leaderboard : []).slice(0, limit);
+    if (!entries.length) {
+      return `<div style="color:${PANEL_COLORS.faint};font-size:${compact ? '10px' : '11px'};text-align:center;padding:${compact ? '3px' : '6px'} 0">Pas de classement disponible</div>`;
+    }
+
+    const maxValue = Math.max(...entries.map((entry) => Number(entry.value) || 0), 1);
+    const podiumColors = [PANEL_COLORS.accent, '#c7b8a1', '#b87b4b'];
+    return entries.map((entry, index) => {
+      const value = Number(entry.value) || 0;
+      const width = Math.max(compact ? 10 : 8, Math.round((value / maxValue) * 100));
+      const title = entry.mapped && entry.sourceLabel !== entry.label ? `${entry.label} (${entry.sourceLabel})` : entry.label;
+      const rankColor = podiumColors[index] || '#7a6770';
+      const deltaBadge = entry.delta_label
+        ? `<span title="Delta session live" style="display:inline-block;padding:0 4px;margin-left:4px;border-radius:6px;background:rgba(120,200,143,.18);color:${PANEL_COLORS.ok};font-weight:700;font-size:${compact ? '9px' : '10px'}">${escapeHtml(entry.delta_label)}</span>`
+        : '';
+      return `
+        <div style="display:grid;grid-template-columns:${compact ? '12px' : '14px'} minmax(0,1fr) auto;align-items:center;gap:${compact ? '4px' : '6px'};min-width:0">
+          <span style="color:${rankColor};font-weight:700;font-size:${compact ? '10px' : '11px'};text-align:center">${index + 1}</span>
+          <span title="${escapeHtml(title)}" style="position:relative;min-width:0;overflow:hidden;border-radius:3px;background:rgba(255,255,255,.045);height:${compact ? '15px' : '18px'}">
+            <span style="display:block;width:${width}%;height:100%;background:linear-gradient(90deg,rgba(199,154,75,.46),rgba(157,58,104,.22));border-radius:3px"></span>
+            <span style="position:absolute;inset:0 ${compact ? '4px' : '6px'};display:flex;align-items:center;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:${PANEL_COLORS.text};font-size:${compact ? '10px' : '11px'}">${escapeHtml(entry.label)}</span>
+          </span>
+          <span style="color:${PANEL_COLORS.accent};font-weight:700;font-size:${compact ? '10px' : '11px'};min-width:${compact ? '24px' : '28px'};text-align:right">${escapeHtml(entry.value_label || value)}${deltaBadge}</span>
+        </div>
+      `;
+    }).join('');
+  }
+
   function renderKikimeter(liveSummary, selectedMetricId) {
     const metrics = Array.isArray(liveSummary.profile_metrics) ? liveSummary.profile_metrics : [];
     const metric = liveSummary.selected_metric || getSelectedProfileMetric(metrics, selectedMetricId);
@@ -858,54 +1209,67 @@
 
     if (!metric) {
       return `
-        <div style="margin:7px 0 8px;padding:7px;border:1px solid rgba(255,255,255,.12);border-radius:6px;background:rgba(255,255,255,.04)">
-          <div style="font-weight:700;color:#f7edf2;margin-bottom:4px">Kikimeter live</div>
-          <div style="color:#b9a5ae;font-size:11px">${escapeHtml(profileStatus || 'Aucune mesure live disponible')}</div>
+        <div style="margin:0;padding:8px;border:1px solid ${PANEL_COLORS.borderSoft};border-radius:6px;background:rgba(255,255,255,.035)">
+          <div style="font-weight:700;color:${PANEL_COLORS.text};margin-bottom:4px">Kikimeter</div>
+          <div style="color:${PANEL_COLORS.muted};font-size:11px">${escapeHtml(profileStatus || 'Aucune mesure live disponible')}</div>
         </div>
       `;
     }
 
-    const maxValue = Math.max(...leaderboard.map((entry) => Number(entry.value) || 0), 1);
     const resultDeltaBadge = mergedResult?.delta_label
-      ? ` <span style="display:inline-block;padding:0 5px;border-radius:8px;background:rgba(113,212,147,.18);color:#71d493;font-weight:700;font-size:10px">${escapeHtml(mergedResult.delta_label)}</span>`
+      ? `<span style="display:inline-block;padding:1px 6px;border-radius:10px;background:rgba(120,200,143,.18);color:${PANEL_COLORS.ok};font-weight:700;font-size:10px">${escapeHtml(mergedResult.delta_label)}</span>`
       : '';
-    const resultLine = mergedResult
-      ? `<div style="margin-bottom:6px;color:#b9a5ae;font-size:11px">RollCodex: <b style="color:#f7edf2">${escapeHtml(mergedResult.label)}</b>${resultDeltaBadge}${mergedResult.count != null ? ` - ${mergedResult.count} ev.` : ''}</div>`
+    const resultTitle = mergedResult?.count != null
+      ? ` title="${escapeHtml(`${mergedResult.count} evenement(s) RollCodex utilises pour cette mesure`)}"`
       : '';
-    const buttons = metrics.map((item) => {
-      const isSelected = item.id === metric.id;
+    const resultSummary = mergedResult
+      ? `
+        <span${resultTitle} style="display:inline-flex;align-items:baseline;gap:5px;margin-left:auto;padding:1px 6px;border-left:1px solid ${PANEL_COLORS.borderSoft};background:rgba(255,255,255,.025);border-radius:5px">
+          <span style="color:${PANEL_COLORS.muted};font-size:9px;letter-spacing:.04em;text-transform:uppercase">Global</span>
+          <b style="color:${PANEL_COLORS.accent};font-size:15px;line-height:1">${escapeHtml(mergedResult.label)}</b>
+          ${resultDeltaBadge}
+        </span>
+      `
+      : '';
+    const options = metrics.map((item) => {
       return `
-        <button type="button" data-rollcodex-kiki-metric="${escapeHtml(item.id)}" title="${escapeHtml(item.label)}" style="cursor:pointer;background:${isSelected ? '#d92a78' : '#2a2228'};color:#f7edf2;border:1px solid ${isSelected ? 'rgba(255,255,255,.25)' : 'rgba(255,255,255,.14)'};border-radius:4px;min-height:24px;padding:3px 6px;font-size:11px;max-width:126px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(item.label)}</button>
+        <option value="${escapeHtml(item.id)}" ${item.id === metric.id ? 'selected' : ''}>${escapeHtml(item.label)}</option>
       `;
     }).join('');
-    const rows = leaderboard.length ? leaderboard.map((entry, index) => {
-      const value = Number(entry.value) || 0;
-      const width = Math.max(8, Math.round((value / maxValue) * 100));
-      const title = entry.mapped && entry.sourceLabel !== entry.label ? `${entry.label} (${entry.sourceLabel})` : entry.label;
-      const deltaBadge = entry.delta_label
-        ? ` <span title="Delta session live" style="display:inline-block;padding:0 4px;margin-left:4px;border-radius:6px;background:rgba(113,212,147,.18);color:#71d493;font-weight:700;font-size:10px">${escapeHtml(entry.delta_label)}</span>`
-        : '';
-      return `
-        <div style="display:grid;grid-template-columns:18px minmax(0,1fr) auto;align-items:center;gap:5px;min-width:0">
-          <span style="color:#b9a5ae">#${index + 1}</span>
-          <span title="${escapeHtml(title)}" style="position:relative;min-width:0;overflow:hidden;border-radius:4px;background:rgba(255,255,255,.06)">
-            <span style="display:block;width:${width}%;height:100%;min-height:18px;background:rgba(217,42,120,.22)"></span>
-            <span style="position:absolute;inset:1px 5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#f7edf2">${escapeHtml(entry.label)}</span>
-          </span>
-          <span style="color:#e9bfd0;font-weight:700">${escapeHtml(entry.value_label || value)}${deltaBadge}</span>
-        </div>
-      `;
-    }).join('') : '<div style="color:#b9a5ae">Aucun score visible</div>';
+    const rows = renderKikimeterRows(leaderboard, metric, { limit: 5 });
 
     return `
-      <div style="margin:7px 0 8px;padding:7px;border:1px solid rgba(255,255,255,.12);border-radius:6px;background:rgba(255,255,255,.04)">
+      <div style="margin:0;padding:7px;border:1px solid ${PANEL_COLORS.borderSoft};border-radius:7px;background:rgba(255,255,255,.035)">
         <div style="display:flex;align-items:center;justify-content:space-between;gap:6px;margin-bottom:5px">
-          <span style="font-weight:700;color:#f7edf2">Kikimeter live</span>
-          <span style="color:#e9bfd0;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(metric.label)}</span>
+          <span style="font-weight:700;color:${PANEL_COLORS.text};font-size:12px">Kikimeter</span>
+          ${resultSummary}
         </div>
-        <div style="display:flex;gap:4px;flex-wrap:wrap;margin-bottom:6px">${buttons}</div>
-        ${resultLine}
-        <div style="display:grid;gap:4px;font-size:11px">${rows}</div>
+        <div style="display:grid;grid-template-columns:minmax(118px,145px) minmax(0,1fr);gap:7px;align-items:start">
+          <div style="display:grid;gap:5px;min-width:0">
+            <select data-rollcodex-kiki-select title="Mesure active" style="width:100%;min-height:26px;background:${PANEL_COLORS.bgSoft};color:${PANEL_COLORS.text};border:1px solid ${PANEL_COLORS.borderSoft};border-radius:5px;padding:3px 6px;font:11px Arial,sans-serif">${options}</select>
+          </div>
+          <div style="display:grid;gap:4px;min-width:0">${rows}</div>
+        </div>
+      </div>
+    `;
+  }
+
+  function renderCollapsedKikimeter(liveSummary, selectedMetricId) {
+    const metrics = Array.isArray(liveSummary.profile_metrics) ? liveSummary.profile_metrics : [];
+    const metric = liveSummary.selected_metric || getSelectedProfileMetric(metrics, selectedMetricId);
+    if (!metric) {
+      return `<div data-rollcodex-collapsed-ranking style="margin-top:6px;color:${PANEL_COLORS.muted};font-size:10px">Aucune mesure active</div>`;
+    }
+    const leaderboard = Array.isArray(liveSummary.leaderboard) ? liveSummary.leaderboard : [];
+    const mergedResult = liveSummary.metric_result || metric.result || null;
+    const rows = renderKikimeterRows(leaderboard, metric, { compact: true, limit: 3 });
+    return `
+      <div data-rollcodex-collapsed-ranking style="display:grid;gap:7px;opacity:.9">
+        <div style="display:flex;align-items:baseline;gap:8px;min-width:0">
+          <div title="${escapeHtml(metric.label)}" style="color:${PANEL_COLORS.text};font-weight:700;font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0;flex:1">${escapeHtml(metric.label)}</div>
+          <div style="color:${PANEL_COLORS.accent};font-weight:800;font-size:18px;line-height:1;text-align:right">${escapeHtml(mergedResult?.label || '-')}</div>
+        </div>
+        <div style="display:grid;gap:3px;min-width:0">${rows}</div>
       </div>
     `;
   }
@@ -1030,54 +1394,55 @@
     const kikimeterSettings = state.kikimeterSettings || { metric_id: '' };
     const liveSummary = state.liveSummary || { totals: createEmptyLiveMetricTotals(), top_participants: [] };
     const liveTotals = liveSummary.totals || createEmptyLiveMetricTotals();
-    const topSpeaker = liveSummary.top_participants?.[0]?.speaker || 'Table Roll20';
     const status = state.status || (connection ? 'Connecte' : 'Non connecte');
-    const target = connection ? renderConnectionTarget(connection) : escapeHtml('Extension prete a connecter');
+    const statusLabel = compactPanelStatus(status, connection);
+    const target = connection ? renderCompactConnectionTarget(connection) : escapeHtml('Pret pour jumelage');
     const kikimeter = renderKikimeter(liveSummary, kikimeterSettings.metric_id);
-    const connectButton = connection ? '' : '<button type="button" data-rollcodex-connect style="cursor:pointer;background:#d92a78;color:white;border:0;border-radius:4px;min-height:28px;padding:5px 8px">Connecter</button>';
+    const collapsedKikimeter = renderCollapsedKikimeter(liveSummary, kikimeterSettings.metric_id);
+    const connectButton = connection ? '' : `<button type="button" data-rollcodex-connect title="Connecter RollCodex" style="${panelButtonStyle('primary')}">Lier</button>`;
     panel.style.cssText = getPanelCss(panelSettings);
+    panel.removeAttribute('title');
+    panel.onpointerdown = null;
 
     if (panelSettings.collapsed) {
       panel.innerHTML = `
-        <div style="display:flex;align-items:center;gap:8px">
-          <span style="display:block;width:8px;height:8px;border-radius:999px;background:${connection ? '#71d493' : '#d9a72a'};box-shadow:0 0 0 3px rgba(255,255,255,.08)"></span>
-          <div style="min-width:0;flex:1">
-            <div style="font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">RollCodex</div>
-            <div style="color:#b9a5ae;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${escapeHtml(status)}</div>
-          </div>
-          <button type="button" data-rollcodex-toggle-panel title="Ouvrir" style="cursor:pointer;background:#d92a78;color:white;border:0;border-radius:4px;min-height:26px;padding:4px 7px">Ouvrir</button>
-        </div>
+        ${collapsedKikimeter}
       `;
-      panel.querySelector('[data-rollcodex-toggle-panel]')?.addEventListener('click', togglePanelCollapsed);
+      panel.title = 'Cliquer pour ouvrir, glisser pour deplacer';
+      panel.onpointerdown = (event) => beginPanelDrag(event, { onClick: togglePanelCollapsed, ignoreInteractive: false });
       return;
     }
 
     panel.innerHTML = `
-      <div style="display:flex;align-items:center;gap:6px;margin-bottom:6px">
-        <div style="font-weight:700;min-width:0;flex:1">RollCodex</div>
-        <button type="button" data-rollcodex-drag-handle title="Deplacer" style="cursor:grab;background:#2a2228;color:#f7edf2;border:1px solid rgba(255,255,255,.14);border-radius:4px;min-height:26px;padding:4px 7px">Deplacer</button>
-        <button type="button" data-rollcodex-toggle-panel title="Reduire" style="cursor:pointer;background:#2a2228;color:#f7edf2;border:1px solid rgba(255,255,255,.14);border-radius:4px;min-height:26px;padding:4px 7px">Reduire</button>
-      </div>
-      <div style="margin-bottom:6px;min-width:0">${target}</div>
-      <div style="margin-bottom:4px;color:#d7c1ca">Live: ${liveTotals.messages} msg - ${liveTotals.rolls} jets - ${liveTotals.criticals} crit - ${liveTotals.damage} degats - ${liveTotals.healing} soins</div>
-      <div style="margin-bottom:6px;color:#b9a5ae">Actif: ${escapeHtml(topSpeaker)}</div>
-      ${kikimeter}
-      <div data-rollcodex-status style="margin-bottom:8px;color:#c8f0d0">${escapeHtml(status)}</div>
-      <div style="display:flex;gap:6px;flex-wrap:wrap">
-        ${connectButton}
-        <button type="button" data-rollcodex-chat-send style="cursor:pointer;background:#335f9f;color:white;border:0;border-radius:4px;min-height:28px;padding:5px 8px" ${connection ? '' : 'disabled'}>Envoyer</button>
-        <button type="button" data-rollcodex-end-session style="cursor:pointer;background:#4d426f;color:white;border:0;border-radius:4px;min-height:28px;padding:5px 8px" ${connection ? '' : 'disabled'}>Fin</button>
-        <button type="button" data-rollcodex-auto style="cursor:pointer;background:${autoSettings.enabled ? '#236347' : '#5c4230'};color:white;border:0;border-radius:4px;min-height:28px;padding:5px 8px">Auto ${autoSettings.enabled ? 'ON' : 'OFF'}</button>
-        <button type="button" data-rollcodex-forget style="cursor:pointer;background:#3a2d34;color:white;border:0;border-radius:4px;min-height:28px;padding:5px 8px">Oublier</button>
-      </div>
-      <div style="display:flex;align-items:center;gap:6px;margin-top:7px;color:#b9a5ae">
-        <button type="button" data-rollcodex-auto-minus style="cursor:pointer;background:#2a2228;color:#f7edf2;border:1px solid rgba(255,255,255,.14);border-radius:4px;min-height:24px;min-width:26px">-</button>
-        <span data-rollcodex-auto-minutes>Auto ${Math.round((autoSettings.idleMs || DEFAULT_AUTO_IDLE_MS) / 60000)} min</span>
-        <button type="button" data-rollcodex-auto-plus style="cursor:pointer;background:#2a2228;color:#f7edf2;border:1px solid rgba(255,255,255,.14);border-radius:4px;min-height:24px;min-width:26px">+</button>
+      <div style="display:grid;grid-template-columns:minmax(154px,170px) minmax(300px,1fr);gap:8px;align-items:start">
+        <div style="min-width:0">
+          <div data-rollcodex-panel-grip title="Glisser pour deplacer" style="display:flex;align-items:center;gap:6px;margin-bottom:5px;cursor:grab">
+            <div style="font-weight:700;min-width:0;flex:1">RollCodex</div>
+            <span data-rollcodex-status title="${escapeHtml(status)}" style="color:${PANEL_COLORS.ok};font-size:10px;max-width:58px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(statusLabel)}</span>
+            <button type="button" data-rollcodex-toggle-panel title="Reduire" style="${panelButtonStyle('secondary')};min-height:20px;min-width:22px;padding:1px 6px;font-size:12px;line-height:1">-</button>
+          </div>
+          <div title="${target}" style="margin-bottom:4px;color:${PANEL_COLORS.accent};min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px">${target}</div>
+          <div style="display:flex;gap:5px;flex-wrap:wrap;margin-bottom:6px;color:${PANEL_COLORS.muted};font-size:10px">
+            <span>${liveTotals.messages} msg</span>
+            <span>${liveTotals.rolls} jets</span>
+          </div>
+          <div style="display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:4px">
+            ${connectButton}
+            <button type="button" data-rollcodex-chat-send title="Envoyer vers RollCodex" style="${panelButtonStyle('primary')}" ${connection ? '' : 'disabled'}>Env.</button>
+            <button type="button" data-rollcodex-auto title="Capture auto ${autoSettings.enabled ? 'active' : 'inactive'}" style="${panelButtonStyle(autoSettings.enabled ? 'green' : 'brown')}">Auto</button>
+            <button type="button" data-rollcodex-end-session title="Fin de session" style="${panelButtonStyle('purple')}" ${connection ? '' : 'disabled'}>Fin</button>
+            <button type="button" data-rollcodex-forget title="Oublier la connexion" style="${panelButtonStyle('secondary')}">Oub.</button>
+          </div>
+          <div style="display:flex;align-items:center;gap:4px;margin-top:5px;color:${PANEL_COLORS.muted};font-size:10px">
+            <button type="button" data-rollcodex-auto-minus title="Reduire l'intervalle auto" style="${panelButtonStyle('secondary')};min-height:19px;min-width:22px;padding:1px 5px">-</button>
+            <span data-rollcodex-auto-minutes>Auto ${Math.round((autoSettings.idleMs || DEFAULT_AUTO_IDLE_MS) / 60000)} min</span>
+            <button type="button" data-rollcodex-auto-plus title="Augmenter l'intervalle auto" style="${panelButtonStyle('secondary')};min-height:19px;min-width:22px;padding:1px 5px">+</button>
+          </div>
+        </div>
+        <div style="min-width:0">${kikimeter}</div>
       </div>
     `;
-    panel.querySelector('[data-rollcodex-drag-handle]')?.addEventListener('pointerdown', beginPanelDrag);
-    panel.querySelector('[data-rollcodex-drag-handle]')?.addEventListener('dblclick', cyclePanelPosition);
+    panel.querySelector('[data-rollcodex-panel-grip]')?.addEventListener('pointerdown', beginPanelDrag);
     panel.querySelector('[data-rollcodex-toggle-panel]')?.addEventListener('click', togglePanelCollapsed);
     panel.querySelector('[data-rollcodex-connect]')?.addEventListener('click', startExtensionPairing);
     panel.querySelector('[data-rollcodex-chat-send]')?.addEventListener('click', sendExtensionSnapshot);
@@ -1086,27 +1451,44 @@
     panel.querySelector('[data-rollcodex-auto-minus]')?.addEventListener('click', () => adjustAutoIdle(-5));
     panel.querySelector('[data-rollcodex-auto-plus]')?.addEventListener('click', () => adjustAutoIdle(5));
     panel.querySelector('[data-rollcodex-forget]')?.addEventListener('click', forgetExtensionConnection);
-    panel.querySelectorAll('[data-rollcodex-kiki-metric]').forEach((button) => {
-      button.addEventListener('click', () => setKikimeterMetric(button.getAttribute('data-rollcodex-kiki-metric')));
-    });
+    panel.querySelector('[data-rollcodex-kiki-select]')?.addEventListener('change', (event) => setKikimeterMetric(event.target.value));
   }
 
   function updatePanelStatus(status) {
     const node = document.querySelector(`#${PANEL_ID} [data-rollcodex-status]`);
-    if (node) node.textContent = status;
+    if (node) {
+      node.title = status;
+      const connected = !/non connecte|jumelage/i.test(normalizeText(status));
+      node.textContent = compactPanelStatus(status, connected);
+    }
   }
 
-  function beginPanelDrag(event) {
+  function isPanelInteractiveTarget(target) {
+    return Boolean(target?.closest?.('button,select,input,textarea,a,[data-rollcodex-no-drag]'));
+  }
+
+  function beginPanelDrag(event, options = {}) {
     const panel = document.getElementById(PANEL_ID);
     if (!panel) return;
-    event.preventDefault();
+    if (event.button != null && event.button !== 0) return;
+    if (options.ignoreInteractive !== false && isPanelInteractiveTarget(event.target)) return;
     const rect = panel.getBoundingClientRect();
     const startX = event.clientX;
     const startY = event.clientY;
     const startLeft = rect.left;
     const startTop = rect.top;
+    const dragThreshold = 4;
+    let dragging = false;
+    event.preventDefault();
+    panel.style.cursor = 'grabbing';
 
     const onMove = (moveEvent) => {
+      const deltaX = moveEvent.clientX - startX;
+      const deltaY = moveEvent.clientY - startY;
+      if (!dragging) {
+        if (Math.abs(deltaX) + Math.abs(deltaY) < dragThreshold) return;
+        dragging = true;
+      }
       const manualLeft = Math.max(8, Math.round(startLeft + moveEvent.clientX - startX));
       const manualTop = Math.max(8, Math.round(startTop + moveEvent.clientY - startY));
       panel.style.left = `${manualLeft}px`;
@@ -1118,6 +1500,11 @@
     const onUp = async () => {
       document.removeEventListener('pointermove', onMove);
       document.removeEventListener('pointerup', onUp);
+      panel.style.cursor = '';
+      if (!dragging) {
+        if (typeof options.onClick === 'function') await options.onClick();
+        return;
+      }
       const nextRect = panel.getBoundingClientRect();
       await patchPanelSettings({
         position: 'manual',
@@ -1213,13 +1600,11 @@
       '#textchat [class*="message"]',
     ];
     const rows = [];
-    const seen = new Set();
     selectors.forEach((selector) => {
       document.querySelectorAll(selector).forEach((node) => {
         if (rows.some((row) => row === node || row.contains(node))) return;
         const text = normalizeText(node.textContent);
-        if (!text || text.length < 2 || seen.has(text) || isIgnoredChatText(text, '')) return;
-        seen.add(text);
+        if (!text || text.length < 2 || isIgnoredChatText(text, '')) return;
         rows.push(node);
       });
     });
@@ -1247,20 +1632,56 @@
   function normalizeChatRow(node, index) {
     const rawText = normalizeText(node.textContent);
     const key = getChatRowKey(node, index, rawText);
-    const speaker = getChatSpeaker(node, rawText);
+    let speaker = getChatSpeaker(node, rawText);
     if (isIgnoredChatText(rawText, speaker)) return null;
+    const original_speaker = speaker;
+    // Force tous les NPC/monstres à alimenter le vrai nom du GM
+    if (isNpcOrMonsterSpeakerLabel(speaker)) {
+      speaker = getCurrentGmName();
+    }
     const figures = extractRollFigures(rawText);
-    return {
+    // Séparation stricte attaque/dégâts :
+    let actionType = figures.actionType;
+    let rollTotal = figures.rollTotal;
+    let rollNatural = figures.rollNatural;
+    let damageTotal = figures.damageTotal;
+    let healTotal = figures.healTotal;
+    // Renforce la séparation : un message ne peut pas être à la fois attaque ET dégâts
+    if (actionType === 'attack' || actionType === 'spell_attack') {
+      damageTotal = null;
+      healTotal = null;
+      // Si le texte contient aussi un mot-clé "damage" mais c'est une attaque, on ignore le champ dégâts
+    } else if (actionType === 'damage' || actionType === 'spell_damage') {
+      rollTotal = null;
+      rollNatural = null;
+      // Si le texte contient aussi un mot-clé "attack" mais c'est un dégât, on ignore le roll
+    } else {
+      // Si le type n'est ni attaque ni dégâts, on neutralise tout
+      rollTotal = null;
+      rollNatural = null;
+      damageTotal = null;
+      healTotal = null;
+    }
+    const msg = {
       key,
       timestamp: new Date().toISOString(),
       speaker,
+      original_speaker,
       raw_text: rawText,
-      action_type_hint: figures.actionType,
-      roll_total_hint: figures.rollTotal,
-      roll_natural_hint: figures.rollNatural,
-      damage_total_hint: figures.damageTotal,
-      heal_total_hint: figures.healTotal,
+      action_type_hint: actionType,
+      action_name_hint: figures.actionName,
+      sub_type_hint: figures.subType,
+      skill_name_hint: figures.skillName,
+      roll_total_hint: rollTotal,
+      roll_natural_hint: rollNatural,
+      damage_total_hint: damageTotal,
+      heal_total_hint: healTotal,
     };
+    if (speaker === 'GM') {
+      // Log debug pour vérifier la collecte
+      try { console.debug('[RollCodex] Message bucketé GM:', msg); } catch(e){}
+    }
+    return msg;
   }
 
   function getPendingMessagesSlice(messages, lastSentKey) {
@@ -1269,10 +1690,40 @@
     return lastIndex >= 0 ? messages.slice(lastIndex + 1) : messages;
   }
 
+  // Déduplication GM/To GM et fusion des messages identiques (priorité GM)
   async function collectExtensionMessages() {
     const lastSentKey = await getStorageValue(LAST_SENT_KEY);
-    const messages = getChatRows().map(normalizeChatRow).filter(Boolean);
-    const pending = getPendingMessagesSlice(messages, lastSentKey);
+    let messages = getChatRows().map(normalizeChatRow).filter(Boolean);
+    // Passe de déduplication :
+    // - Ne fusionne que GM/To GM entre eux
+    // - Ne supprime jamais un message dont le speaker n'est pas GM/To GM (ex : NPC/monstre)
+    const deduped = [];
+    for (let i = 0; i < messages.length; ++i) {
+      const curr = messages[i];
+      const prev = deduped[deduped.length - 1];
+      // Si les deux sont GM/To GM, fusionne
+      const currIsGm = isGmSpeakerLabel(curr.speaker) || /to gm/i.test(curr.speaker);
+      const prevIsGm = prev && (isGmSpeakerLabel(prev.speaker) || /to gm/i.test(prev.speaker));
+      if (
+        prev &&
+        curr.raw_text === prev.raw_text &&
+        curr.roll_total_hint === prev.roll_total_hint &&
+        curr.damage_total_hint === prev.damage_total_hint &&
+        curr.heal_total_hint === prev.heal_total_hint &&
+        curr.action_type_hint === prev.action_type_hint &&
+        curr.key !== prev.key &&
+        currIsGm && prevIsGm
+      ) {
+        // Priorité au vrai GM
+        if (isGmSpeakerLabel(curr.speaker)) {
+          deduped[deduped.length - 1] = curr;
+        }
+        // Sinon, garder le premier (souvent To GM)
+        continue;
+      }
+      deduped.push(curr);
+    }
+    const pending = getPendingMessagesSlice(deduped, lastSentKey);
     rebuildLiveMetricsFromMessages(pending);
     return pending;
   }
