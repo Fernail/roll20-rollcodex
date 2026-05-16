@@ -142,6 +142,22 @@
     });
   }
 
+  function executeScriptInTab(tabId, files) {
+    return new Promise((resolve) => {
+      const scripting = getExtensionApi()?.scripting;
+      if (!scripting?.executeScript || !tabId) {
+        resolve(false);
+        return;
+      }
+      callExtensionMethod(
+        scripting.executeScript.bind(scripting),
+        [{ target: { tabId }, files }],
+        () => resolve(true),
+        () => resolve(false),
+      );
+    });
+  }
+
   function createTab(url) {
     return new Promise((resolve, reject) => {
       const tabs = getExtensionApi()?.tabs;
@@ -257,6 +273,34 @@
       if (!targetTab?.id) return false;
       return sendTabMessage(targetTab.id, { type: MESSAGE_EXTENSION_CONNECTED, connection: extensionConnection });
     });
+  }
+
+  function ensureRoll20ContentScriptInjected() {
+    return queryTabs({ url: 'https://app.roll20.net/*' }).then((tabs) => {
+      const jobs = (tabs || []).map((tab) => {
+        if (!tab?.id) return Promise.resolve(false);
+        return sendTabMessage(tab.id, { type: MESSAGE_EXTENSION_CONNECTED, connection: null })
+          .then((ok) => (ok ? true : executeScriptInTab(tab.id, ['roll20-content.js'])));
+      });
+      return Promise.all(jobs).then(() => true);
+    }).catch(() => false);
+  }
+
+  function isValidStoredRoll20Connection(connection) {
+    return connection?.provider === 'roll20'
+      && typeof connection.connection_id === 'string'
+      && typeof connection.connection_secret === 'string'
+      && isAllowedSnapshotEndpoint(connection.endpoint);
+  }
+
+  function rehydrateRoll20ConnectionFromStorage() {
+    return ensureRoll20ContentScriptInjected()
+      .then(() => getStorageValue(CONNECTION_KEY))
+      .then((connection) => {
+        if (!isValidStoredRoll20Connection(connection)) return false;
+        return notifyRoll20Tab(connection).catch(() => false);
+      })
+      .catch(() => false);
   }
 
   function parseJsonText(text) {
@@ -478,5 +522,14 @@
       return true;
     }
     return false;
+  });
+
+  // Rehydrate automatiquement la connexion apres refresh/restart de l'extension.
+  rehydrateRoll20ConnectionFromStorage().catch(() => false);
+  getExtensionApi()?.runtime?.onStartup?.addListener(() => {
+    rehydrateRoll20ConnectionFromStorage().catch(() => false);
+  });
+  getExtensionApi()?.runtime?.onInstalled?.addListener(() => {
+    rehydrateRoll20ConnectionFromStorage().catch(() => false);
   });
 })();

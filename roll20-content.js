@@ -1,30 +1,3 @@
-// Récupère le nom du GM courant depuis l'UI Roll20 (fallback sur 'GM')
-function getCurrentGmName() {
-  // Cherche le nom affiché dans la barre Roll20 (avatar en haut à droite)
-  const userNode = document.querySelector('#user-menu .user-name, #user-menu .display-name, .user-menu .user-name, .user-menu .display-name');
-  const name = userNode ? normalizeText(userNode.textContent) : '';
-  if (name && name.length > 1 && name.length < 40) return name;
-  // Fallback sur le nom du premier joueur actif GM dans la liste
-  const gmNode = document.querySelector('.player[data-is_gm="true"] .player-name, .player[data-is_gm="true"] .display-name');
-  const gmName = gmNode ? normalizeText(gmNode.textContent) : '';
-  if (gmName && gmName.length > 1 && gmName.length < 40) return gmName;
-  return 'GM';
-}
-// Détecte si un speaker est un NPC/monstre (ni GM, ni joueur)
-function isNpcOrMonsterSpeakerLabel(speaker) {
-  const s = normalizeText(speaker).toLowerCase();
-  if (!s || isGmSpeakerLabel(s) || /to gm/i.test(s)) return false;
-  // Heuristique : si ce n'est pas GM, ni un nom de joueur connu, ni vide, on considère NPC/monstre
-  // (optionnel : affiner avec une liste de joueurs connus si dispo)
-  // On exclut les speakers vides ou génériques
-  if (s === 'roll20' || s === 'system' || s === 'api') return false;
-  // Si le nom contient "npc", "monstre", "monster", "ennemi", etc.
-  if (/npc|monstre|monster|ennemi|enemy|creature|bestiol|hostile/.test(s)) return true;
-  // Si le nom ne ressemble pas à un prénom ou pseudo joueur (simple heuristique)
-  if (/gobelin|orc|dragon|zombie|squelette|bandit|cultiste|rat|chien|wolf|golem|démon|demon|sorcière|witch|beholder|troll|ogre|vampire|lich|spectre|wraith|slime|gelée|blob|elemental|géant|giant|spider|araignée|kobold|gnoll|worg|wight|mimic|basilic|chimère|hydre|hydra|griffon|griffin|wyverne|wyvern|harpie|harpy|goule|ghoul|sahuagin|aboleth|myconide|myconid|drow|elfe noir|hobgobelin|hobgoblin|gnome|nain|dwarf|elfe|elf|humain|human|ogre|troll|tarrasque|rakshasa|rakshaza|rakshasa|rakshaza/.test(s)) return true;
-  // Par défaut, si ce n'est pas GM, on considère NPC/monstre
-  return true;
-}
 (() => {
   const MESSAGE_SEND_CHAT_COMMAND = 'ROLLCODEX_ROLL20_SEND_CHAT_COMMAND';
   const MESSAGE_SEND_SNAPSHOT = 'ROLLCODEX_ROLL20_SEND_SNAPSHOT';
@@ -84,6 +57,8 @@ function isNpcOrMonsterSpeakerLabel(speaker) {
     recentEvents: [],
     totals: createEmptyLiveMetricTotals(),
   };
+  let lastResolvedChatSpeaker = '';
+  let currentMappingProfile = null;
 
   const INPUT_SELECTORS = [
     '#textchat-input textarea',
@@ -145,6 +120,7 @@ function isNpcOrMonsterSpeakerLabel(speaker) {
     liveMetricsState.participants = new Map();
     liveMetricsState.recentEvents = [];
     liveMetricsState.totals = createEmptyLiveMetricTotals();
+    lastResolvedChatSpeaker = '';
   }
 
   function rebuildLiveMetricsFromMessages(messages) {
@@ -281,8 +257,8 @@ function isNpcOrMonsterSpeakerLabel(speaker) {
       actionName: inferActionNameHint(text, actionType),
       subType: inferSubTypeHint(text, actionType),
       skillName: inferSkillNameHint(text, actionType),
-      isCritical: rollNatural === 20 || /\b(?:critical|critique)\b/i.test(text),
-      isFumble: rollNatural === 1 || /\b(?:fumble|echec critique)\b/i.test(text),
+      isCritical: rollNatural === 20 || /\b(?:critical|critique|crit\s+(?:damage|dmg|degats|hit|touche))\b/i.test(text),
+      isFumble: rollNatural === 1 || /\b(?:fumble|echec\s+critique|critical\s+fail)\b/i.test(text),
       hasRoll,
     };
   }
@@ -317,6 +293,76 @@ function isNpcOrMonsterSpeakerLabel(speaker) {
 
   function isGmSpeakerLabel(value) {
     return /\b(?:gm|mj|game\s*master|maitre\s*du\s*jeu|maître\s*du\s*jeu|dungeon\s*master|dm)\b/i.test(normalizeSpeakerLabel(value));
+  }
+
+  function getCurrentGmName() {
+    // .player-name reste stable meme quand le MJ "parle en tant que" un PNJ ;
+    // .display-name suit l'impersonification et ne peut pas servir de nom canonique.
+    const gmAccountNode = document.querySelector('.player[data-is_gm="true"] .player-name');
+    const accountName = gmAccountNode ? normalizeText(gmAccountNode.textContent) : '';
+    if (accountName && accountName.length > 1 && accountName.length < 40) return accountName;
+    const userNode = document.querySelector('#user-menu .user-name, .user-menu .user-name');
+    const name = userNode ? normalizeText(userNode.textContent) : '';
+    if (name && name.length > 1 && name.length < 40) return name;
+    const gmNode = document.querySelector('.player[data-is_gm="true"] .display-name');
+    const gmName = gmNode ? normalizeText(gmNode.textContent) : '';
+    if (gmName && gmName.length > 1 && gmName.length < 40) return gmName;
+    return 'GM';
+  }
+
+  function isNpcOrMonsterSpeakerLabel(speaker) {
+    const s = normalizeText(speaker).toLowerCase();
+    if (!s || isGmSpeakerLabel(s) || /to gm/i.test(s)) return false;
+    if (s === 'roll20' || s === 'system' || s === 'api') return false;
+    if (/npc|monstre|monster|ennemi|enemy|creature|bestiol|hostile/.test(s)) return true;
+    if (/gobelin|orc|dragon|zombie|squelette|bandit|cultiste|rat|chien|wolf|golem|demon|sorciere|witch|beholder|troll|ogre|vampire|lich|spectre|wraith|slime|gelee|blob|elemental|geant|giant|spider|araignee|kobold|gnoll|worg|wight|mimic|basilic|chimere|hydre|hydra|griffon|griffin|wyverne|wyvern|harpie|harpy|goule|ghoul|sahuagin|aboleth|myconide|myconid|drow|elfe noir|hobgobelin|hobgoblin|gnome|nain|dwarf|elfe|elf|humain|human|tarrasque|rakshasa|rakshaza/.test(s)) return true;
+    return false;
+  }
+
+  function isSpeakerRoutedToGm(value) {
+    const label = normalizeSpeakerLabel(value).toLowerCase();
+    if (!label) return false;
+    if (isGmSpeakerLabel(label) || /to\s*gm/i.test(label)) return true;
+    const gmName = normalizeSpeakerLabel(getCurrentGmName()).toLowerCase();
+    return Boolean(gmName && label === gmName);
+  }
+
+  function getVisibleHumanSpeakerLabels() {
+    const labels = new Set();
+    // Pour les joueurs (non-MJ), on accepte player-name ET display-name (le display peut etre le nom du PJ).
+    document.querySelectorAll('.player:not([data-is_gm="true"]) .player-name, .player:not([data-is_gm="true"]) .display-name').forEach((node) => {
+      const label = normalizeSpeakerLabel(node?.textContent).toLowerCase();
+      if (label && !isGmSpeakerLabel(label)) labels.add(label);
+    });
+    // Pour le MJ, on n'accepte que player-name : .display-name suit l'impersonification et polluerait le set.
+    document.querySelectorAll('.player[data-is_gm="true"] .player-name').forEach((node) => {
+      const label = normalizeSpeakerLabel(node?.textContent).toLowerCase();
+      if (label) labels.add(label);
+    });
+    const gmName = normalizeSpeakerLabel(getCurrentGmName()).toLowerCase();
+    if (gmName) labels.add(gmName);
+    return labels;
+  }
+
+  function isKnownHumanSpeakerLabel(value) {
+    const label = normalizeSpeakerLabel(value).toLowerCase();
+    if (!label) return false;
+    return getVisibleHumanSpeakerLabels().has(label);
+  }
+
+  function getProfileSpeakerRole(profile, speaker) {
+    const speakerKey = normalizeMappingKey(speaker);
+    if (!speakerKey || !profile?.speaker_roles) return null;
+    return (Array.isArray(profile.speaker_roles) ? profile.speaker_roles : []).find((entry) => {
+      const entryKey = normalizeMappingKey(entry?.speaker_key || entry?.source_key || entry?.speaker_label);
+      return entryKey && entryKey === speakerKey;
+    }) || null;
+  }
+
+  function shouldRouteSpeakerToGm(profile, speaker) {
+    const role = getProfileSpeakerRole(profile, speaker);
+    if (!role) return false;
+    return role.role === 'npc' || role.force_gm === true;
   }
 
   function getChatSender(node) {
@@ -369,12 +415,28 @@ function isNpcOrMonsterSpeakerLabel(speaker) {
 
   function getChatSpeaker(node, rawText) {
     const sender = getChatSender(node);
-    if (isGmSpeakerLabel(sender)) return sender;
-
     const rollCardSpeaker = getRollCardSpeaker(node, rawText);
-    if (rollCardSpeaker) return rollCardSpeaker;
+    // Cas clef: message whisper/to GM.
+    // - Si la carte identifie un speaker non GM: garder ce speaker (PJ) sauf s'il est NPC/monstre.
+    // - Si c'est NPC/monstre, router vers GM pour fusionner sur la ligne GM.
+    if (isGmSpeakerLabel(sender) || /to\s*gm/i.test(sender || '')) {
+      if (rollCardSpeaker && !isGmSpeakerLabel(rollCardSpeaker) && !/to\s*gm/i.test(rollCardSpeaker)) {
+        if (isNpcOrMonsterSpeakerLabel(rollCardSpeaker) || !isKnownHumanSpeakerLabel(rollCardSpeaker)) return getCurrentGmName();
+        return rollCardSpeaker;
+      }
+      return getCurrentGmName();
+    }
 
-    if (sender) return sender;
+    if (sender) {
+      if (isNpcOrMonsterSpeakerLabel(sender) || !isKnownHumanSpeakerLabel(sender)) return getCurrentGmName();
+      return sender;
+    }
+
+    if (rollCardSpeaker) {
+      if (isNpcOrMonsterSpeakerLabel(rollCardSpeaker) || !isKnownHumanSpeakerLabel(rollCardSpeaker)) return getCurrentGmName();
+      return rollCardSpeaker;
+    }
+
     return normalizeSpeakerLabel(getSpeakerFromText(rawText)) || 'Roll20';
   }
 
@@ -579,7 +641,15 @@ function isNpcOrMonsterSpeakerLabel(speaker) {
   function getPanelPositionStyles(settings) {
     const normalized = normalizePanelPosition(settings?.position);
     if (normalized === 'manual') {
-      return [`left:${Number(settings.manualLeft) || 64}px`, `top:${Number(settings.manualTop) || 76}px`];
+      const rawLeft = Number(settings.manualLeft);
+      const rawTop = Number(settings.manualTop);
+      const left = Number.isFinite(rawLeft) ? rawLeft : 64;
+      const top = Number.isFinite(rawTop) ? rawTop : 76;
+      const maxLeft = Math.max(8, (window.innerWidth || 1280) - 120);
+      const maxTop = Math.max(8, (window.innerHeight || 720) - 48);
+      const safeLeft = Math.min(Math.max(8, Math.round(left)), maxLeft);
+      const safeTop = Math.min(Math.max(8, Math.round(top)), maxTop);
+      return [`left:${safeLeft}px`, `top:${safeTop}px`];
     }
     if (normalized === 'top-left') return ['left:64px', 'top:76px'];
     if (normalized === 'bottom-right') return ['right:max(18px, min(340px, calc(100vw - 320px)))', 'bottom:18px'];
@@ -948,7 +1018,29 @@ function isNpcOrMonsterSpeakerLabel(speaker) {
 
   function getMetricBucket(profile, message) {
     const speaker = normalizeSpeakerLabel(message?.speaker) || 'Roll20';
-    const mapping = resolveSpeakerMapping(profile, speaker) || resolveSpeakerMappingFromText(profile, message?.raw_text);
+    // Evite les faux positifs de speaker quand le texte contient des labels d'autres joueurs.
+    // Le fallback texte est reserve aux lignes generiques non attribuees.
+    const mapping = resolveSpeakerMapping(profile, speaker)
+      || (speaker === 'Roll20' ? resolveSpeakerMappingFromText(profile, message?.raw_text) : null);
+    const gmName = normalizeSpeakerLabel(getCurrentGmName());
+    const gmMapping = gmName ? resolveSpeakerMapping(profile, gmName) : null;
+    const forceGmByProfile = shouldRouteSpeakerToGm(profile, speaker);
+
+    // On ne route vers le bucket GM que sur signal positif :
+    //   - le profil RollCodex marque le speaker comme 'npc' (PNJ enregistre cote backend)
+    //   - le speaker correspond deja au GM (isSpeakerRoutedToGm)
+    // Un speaker inconnu (jamais mappe, pas dans le profil) garde son propre bucket : c'est ce qui
+    // permet au MJ de jouer "as Aline" sans que ses jets ne soient absorbes par la ligne GM.
+    if (forceGmByProfile && (gmMapping?.target_id || gmName)) {
+      return {
+        key: gmMapping?.target_id
+          ? buildMetricTargetKey(normalizeText(gmMapping.target_kind || 'target') || 'target', gmMapping.target_id)
+          : `speaker:${normalizeMappingKey(gmName || 'GM')}`,
+        label: normalizeText(gmMapping?.target_label) || gmName || 'GM',
+        sourceLabel: speaker,
+        mapped: true,
+      };
+    }
     const targetId = normalizeText(mapping?.target_id);
     const targetKind = normalizeText(mapping?.target_kind);
     const label = normalizeText(mapping?.target_label) || speaker;
@@ -963,15 +1055,18 @@ function isNpcOrMonsterSpeakerLabel(speaker) {
   function addMetricContribution(bucket, metric, message) {
     const aggregation = metric.aggregation || 'count';
     if (aggregation === 'percent_critical') {
-      if (!isRollLikeMessage(message)) return false;
+      const hasCritFlag = message.is_critical_hint === true;
+      // On accepte les cartes "Crit Damage" (degats uniquement, sans d20) comme preuves de critique.
+      if (!isRollLikeMessage(message) && !hasCritFlag) return false;
       bucket.denominator += 1;
-      if (message.roll_natural_hint === 20) bucket.numerator += 1;
+      if (message.roll_natural_hint === 20 || hasCritFlag) bucket.numerator += 1;
       return true;
     }
     if (aggregation === 'percent_fumble') {
-      if (!isRollLikeMessage(message)) return false;
+      const hasFumbleFlag = message.is_fumble_hint === true;
+      if (!isRollLikeMessage(message) && !hasFumbleFlag) return false;
       bucket.denominator += 1;
-      if (message.roll_natural_hint === 1) bucket.numerator += 1;
+      if (message.roll_natural_hint === 1 || hasFumbleFlag) bucket.numerator += 1;
       return true;
     }
     if (aggregation === 'percent') {
@@ -1079,18 +1174,22 @@ function isNpcOrMonsterSpeakerLabel(speaker) {
     const { buckets, totals } = computeLiveDeltaForMetric(profile, metric);
     const family = metricAggregationFamily(metric);
 
-    const totalDelta = bucketValueForMetric(totals, metric);
+    const liveValue = bucketValueForMetric(totals, metric);
     const baselineValue = Number(baselineResult?.value) || 0;
-    const mergedValue = family.isAdditive ? baselineValue + totalDelta : baselineValue;
-    const hasDelta = totalDelta > 0 || totals.messages > 0;
+    const totalDelta = family.isAdditive ? liveValue : (liveValue - baselineValue);
+    const mergedValue = baselineValue + totalDelta;
+    const hasDelta = Math.abs(totalDelta) > 0.01 || totals.messages > 0;
+    const deltaLabel = Math.abs(totalDelta) > 0.01
+      ? `${totalDelta > 0 ? '+' : '-'}${formatMetricValue(Math.abs(totalDelta), metric)}`
+      : '';
     const metricResult = baselineResult || hasDelta ? {
       value: mergedValue,
       label: family.isAdditive
         ? formatMetricValue(mergedValue, metric)
-        : (baselineResult?.label || formatMetricValue(baselineValue, metric)),
+        : formatMetricValue(mergedValue, metric),
       count: (Number(baselineResult?.count) || 0) + totals.messages,
       delta_value: totalDelta,
-      delta_label: hasDelta && totalDelta > 0 ? `+${formatMetricValue(totalDelta, metric)}` : '',
+      delta_label: deltaLabel,
       delta_count: totals.messages,
       has_delta: hasDelta,
     } : null;
@@ -1111,8 +1210,7 @@ function isNpcOrMonsterSpeakerLabel(speaker) {
     });
 
     for (const [bucketKey, bucket] of buckets.entries()) {
-      const deltaValue = bucketValueForMetric(bucket, metric);
-      if (deltaValue <= 0 && bucket.messages === 0) continue;
+      const liveBucketValue = bucketValueForMetric(bucket, metric);
 
       let entry = merged.get(bucketKey);
       if (!entry) {
@@ -1120,7 +1218,7 @@ function isNpcOrMonsterSpeakerLabel(speaker) {
         if (matched) entry = matched;
       }
       if (entry) {
-        entry.delta_value = deltaValue;
+        entry.delta_value = family.isAdditive ? liveBucketValue : (liveBucketValue - entry.baseline_value);
         entry.delta_messages = bucket.messages;
       } else {
         merged.set(bucketKey, {
@@ -1130,17 +1228,18 @@ function isNpcOrMonsterSpeakerLabel(speaker) {
           mapped: bucket.mapped,
           baseline_value: 0,
           baseline_label: '',
-          delta_value: deltaValue,
+          delta_value: liveBucketValue,
           delta_messages: bucket.messages,
         });
       }
     }
 
     const leaderboard = Array.from(merged.values()).map((entry) => {
-      const finalValue = family.isAdditive
-        ? entry.baseline_value + entry.delta_value
-        : entry.baseline_value || entry.delta_value;
-      const entryHasDelta = entry.delta_value > 0 || entry.delta_messages > 0;
+      const finalValue = entry.baseline_value + entry.delta_value;
+      const entryHasDelta = Math.abs(entry.delta_value) > 0.01 || entry.delta_messages > 0;
+      const entryDeltaLabel = Math.abs(entry.delta_value) > 0.01
+        ? `${entry.delta_value > 0 ? '+' : '-'}${formatMetricValue(Math.abs(entry.delta_value), metric)}`
+        : '';
       return {
         key: entry.key,
         label: entry.label,
@@ -1150,7 +1249,7 @@ function isNpcOrMonsterSpeakerLabel(speaker) {
         value: finalValue,
         value_label: formatMetricValue(finalValue, metric),
         delta_value: entry.delta_value,
-        delta_label: entryHasDelta && entry.delta_value > 0 ? `+${formatMetricValue(entry.delta_value, metric)}` : '',
+        delta_label: entryDeltaLabel,
         delta_messages: entry.delta_messages,
         has_delta: entryHasDelta,
       };
@@ -1522,10 +1621,10 @@ function isNpcOrMonsterSpeakerLabel(speaker) {
     const autoSettings = await getAutoSettings();
     const panelSettings = await getPanelSettings();
     const kikimeterSettings = await getKikimeterSettings();
-    const lastSentKey = await getStorageValue(LAST_SENT_KEY);
-    const visibleMessages = getChatRows().map(normalizeChatRow).filter(Boolean);
-    rebuildLiveMetricsFromMessages(getPendingMessagesSlice(visibleMessages, lastSentKey));
     const profile = connection ? await getMappingProfile(connection).catch(() => null) : null;
+    currentMappingProfile = profile;
+    const visibleMessages = getChatRows().map((node, index) => normalizeChatRow(node, index, profile)).filter(Boolean);
+    rebuildLiveMetricsFromMessages(dedupeNormalizedMessages(visibleMessages));
     renderPanel({
       connection,
       autoSettings,
@@ -1629,15 +1728,46 @@ function isNpcOrMonsterSpeakerLabel(speaker) {
     return false;
   }
 
-  function normalizeChatRow(node, index) {
+  function isSystemSpeakerLabel(value) {
+    const label = normalizeSpeakerLabel(value).toLowerCase();
+    return !label || label === 'roll20' || label === 'system' || label === 'api';
+  }
+
+  function isSystemChatMessage(rawText, speaker = '') {
+    const text = normalizeText(rawText).toLowerCase();
+    if (!text) return true;
+    if (isSystemSpeakerLabel(speaker)) return true;
+    if (/\b(astuces de chat|jets de des|jet de des|inviter des joueurs|voici le lien joueur|chuchoter a un joueur|whisper to)\b/i.test(text)) return true;
+    return false;
+  }
+
+  function normalizeChatRow(node, index, mappingProfile = currentMappingProfile) {
     const rawText = normalizeText(node.textContent);
     const key = getChatRowKey(node, index, rawText);
+    const sender = getChatSender(node);
     let speaker = getChatSpeaker(node, rawText);
     if (isIgnoredChatText(rawText, speaker)) return null;
+    if (isSystemChatMessage(rawText, speaker)) return null;
     const original_speaker = speaker;
-    // Force tous les NPC/monstres à alimenter le vrai nom du GM
-    if (isNpcOrMonsterSpeakerLabel(speaker)) {
-      speaker = getCurrentGmName();
+    const gmName = getCurrentGmName();
+    const hadExplicitSpeaker = Boolean(sender || getRollCardSpeaker(node, rawText) || getSpeakerFromText(rawText));
+    // Carry-over speaker generique avant d'evaluer le routage.
+    if ((!speaker || speaker === 'Roll20') && lastResolvedChatSpeaker) {
+      speaker = lastResolvedChatSpeaker;
+    }
+    // Regle :
+    //   1) profil RollCodex le marque 'human' (character avec player_id) -> PJ ;
+    //   2) sinon, s'il apparait dans la liste Roll20 des joueurs connectes hors MJ -> PJ aussi
+    //      (le MJ a juste oublie de le creer dans RollCodex) ;
+    //   3) sinon, on assume MJ -> bucket GM.
+    const routedRole = getProfileSpeakerRole(mappingProfile, speaker);
+    const isProfileHuman = routedRole?.role === 'human';
+    const isConnectedRoll20Player = !isSpeakerRoutedToGm(speaker) && isKnownHumanSpeakerLabel(speaker);
+    if (!isProfileHuman && !isConnectedRoll20Player) {
+      speaker = gmName;
+    }
+    if (!speaker || speaker === 'Roll20') {
+      speaker = gmName;
     }
     const figures = extractRollFigures(rawText);
     // Séparation stricte attaque/dégâts :
@@ -1666,6 +1796,7 @@ function isNpcOrMonsterSpeakerLabel(speaker) {
       key,
       timestamp: new Date().toISOString(),
       speaker,
+      sender: normalizeSpeakerLabel(sender),
       original_speaker,
       raw_text: rawText,
       action_type_hint: actionType,
@@ -1676,10 +1807,11 @@ function isNpcOrMonsterSpeakerLabel(speaker) {
       roll_natural_hint: rollNatural,
       damage_total_hint: damageTotal,
       heal_total_hint: healTotal,
+      is_critical_hint: figures.isCritical === true,
+      is_fumble_hint: figures.isFumble === true,
     };
-    if (speaker === 'GM') {
-      // Log debug pour vérifier la collecte
-      try { console.debug('[RollCodex] Message bucketé GM:', msg); } catch(e){}
+    if (speaker && speaker !== 'Roll20' && (hadExplicitSpeaker || lastResolvedChatSpeaker)) {
+      lastResolvedChatSpeaker = speaker;
     }
     return msg;
   }
@@ -1690,20 +1822,13 @@ function isNpcOrMonsterSpeakerLabel(speaker) {
     return lastIndex >= 0 ? messages.slice(lastIndex + 1) : messages;
   }
 
-  // Déduplication GM/To GM et fusion des messages identiques (priorité GM)
-  async function collectExtensionMessages() {
-    const lastSentKey = await getStorageValue(LAST_SENT_KEY);
-    let messages = getChatRows().map(normalizeChatRow).filter(Boolean);
-    // Passe de déduplication :
-    // - Ne fusionne que GM/To GM entre eux
-    // - Ne supprime jamais un message dont le speaker n'est pas GM/To GM (ex : NPC/monstre)
+  function dedupeNormalizedMessages(messages) {
     const deduped = [];
-    for (let i = 0; i < messages.length; ++i) {
+    for (let i = 0; i < (messages || []).length; ++i) {
       const curr = messages[i];
       const prev = deduped[deduped.length - 1];
-      // Si les deux sont GM/To GM, fusionne
-      const currIsGm = isGmSpeakerLabel(curr.speaker) || /to gm/i.test(curr.speaker);
-      const prevIsGm = prev && (isGmSpeakerLabel(prev.speaker) || /to gm/i.test(prev.speaker));
+      const currIsGm = isSpeakerRoutedToGm(curr?.speaker);
+      const prevIsGm = prev && isSpeakerRoutedToGm(prev.speaker);
       if (
         prev &&
         curr.raw_text === prev.raw_text &&
@@ -1714,17 +1839,25 @@ function isNpcOrMonsterSpeakerLabel(speaker) {
         curr.key !== prev.key &&
         currIsGm && prevIsGm
       ) {
-        // Priorité au vrai GM
-        if (isGmSpeakerLabel(curr.speaker)) {
+        if (isSpeakerRoutedToGm(curr.speaker)) {
           deduped[deduped.length - 1] = curr;
         }
-        // Sinon, garder le premier (souvent To GM)
         continue;
       }
       deduped.push(curr);
     }
+    return deduped;
+  }
+
+  // Déduplication GM/To GM et fusion des messages identiques (priorité GM)
+  async function collectExtensionMessages() {
+    const lastSentKey = await getStorageValue(LAST_SENT_KEY);
+    const messages = getChatRows().map((node, index) => normalizeChatRow(node, index)).filter(Boolean);
+    const deduped = dedupeNormalizedMessages(messages);
     const pending = getPendingMessagesSlice(deduped, lastSentKey);
-    rebuildLiveMetricsFromMessages(pending);
+    // L'affichage live reste base sur les messages visibles, pas uniquement les pending.
+    // Cela évite le reset du panneau après un envoi auto (onglet caché, changement de fenêtre).
+    rebuildLiveMetricsFromMessages(deduped);
     return pending;
   }
 
@@ -1829,6 +1962,7 @@ function isNpcOrMonsterSpeakerLabel(speaker) {
 
     const stored = await getStorageValue(MAPPING_PROFILE_KEY);
     if (!options.force && isFreshMappingProfileCache(stored, connection.connection_id)) {
+      currentMappingProfile = stored.profile;
       return stored.profile;
     }
 
@@ -1846,6 +1980,7 @@ function isNpcOrMonsterSpeakerLabel(speaker) {
     });
 
     if (!response?.ok) {
+      currentMappingProfile = stored?.connection_id === connection.connection_id && stored?.profile?.schema_version ? stored.profile : null;
       return stored?.connection_id === connection.connection_id && stored?.profile?.schema_version ? stored.profile : null;
     }
 
@@ -1860,6 +1995,7 @@ function isNpcOrMonsterSpeakerLabel(speaker) {
           profile,
         },
       });
+      currentMappingProfile = profile;
       if (previousLastUpdate && nextLastUpdate && previousLastUpdate !== nextLastUpdate) {
         // RollCodex a absorbe / l'utilisateur a re-mappe : la baseline englobe maintenant
         // une partie de ce qui etait en live. Le filtrage par LAST_SENT_KEY assure
@@ -1982,6 +2118,7 @@ function isNpcOrMonsterSpeakerLabel(speaker) {
       if (mode === 'auto') autoCaptureInFlight = false;
       return;
     }
+      await getMappingProfile(connection, { force: true }).catch(() => null);
       await setStorageValues({ [LAST_SENT_KEY]: messages[messages.length - 1].key });
       if (mode === 'auto') {
         await patchAutoSettings({ lastAutoSentAt: Date.now() });
@@ -2052,8 +2189,13 @@ function isNpcOrMonsterSpeakerLabel(speaker) {
   }
 
   function sendVisibilitySnapshot() {
-    if (document.visibilityState !== 'hidden') return;
-    sendExtensionSnapshot({ mode: 'auto', reason: 'roll20_tab_hidden', skipIfEmpty: true, silent: true });
+    // Ne pas envoyer au simple changement de fenetre/onglet.
+    // L'envoi auto doit rester pilote par l'inactivite (timer),
+    // ou par les evenements de fermeture (pagehide/beforeunload),
+    // ou par le bouton "Fin".
+    if (document.visibilityState === 'visible') {
+      refreshPanel();
+    }
   }
 
   function sendPagehideSnapshot() {
