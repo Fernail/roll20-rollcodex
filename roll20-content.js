@@ -8,7 +8,7 @@
   const BRIDGE_COMMAND_PREFIX = '!rollcodex bridge ';
   const BRIDGE_SNAPSHOT_MARKER = 'ROLLCODEX_BRIDGE_SNAPSHOT:';
   const BRIDGE_SNAPSHOT_TYPE = 'rollcodex:roll20-bridge-snapshot';
-  const BRIDGE_VERSION = '0.3.3';
+  const BRIDGE_VERSION = '0.4.0';
   const ROLLCODEX_APP_BASE_URL = 'http://localhost:5173';
   const ROLLCODEX_CONNECT_PATH = '/vtt/connect/roll20';
   const PENDING_PAIRING_KEY = 'rollcodexExtensionPendingPairing';
@@ -20,6 +20,15 @@
   const KIKIMETER_SETTINGS_KEY = 'rollcodexExtensionKikimeterSettings';
   const PANEL_ID = 'rollcodex-extension-panel';
   const PANEL_POSITIONS = ['bottom-left', 'top-left', 'bottom-right', 'manual'];
+  const VIEWER_BROADCAST_MARKER = 'ROLLCODEX_BRIDGE_VIEWER:';
+  const VIEWER_BROADCAST_TYPE = 'rollcodex:roll20-viewer-broadcast';
+  const VIEWER_REQUEST_TYPE = 'rollcodex:roll20-viewer-request';
+  const VIEWER_BROADCAST_HEARTBEAT_MS = 5 * 60 * 1000;
+  const VIEWER_BROADCAST_MAX_MARKER_LENGTH = 8800;
+  const VIEWER_BROADCAST_CACHE_KEY = 'rollcodexExtensionViewerBroadcast';
+  const VIEWER_REQUEST_RETRY_DELAYS_MS = [1500, 5000, 15000, 45000];
+  const VIEWER_REQUEST_PERIODIC_MS = 60 * 1000;
+  const VIEWER_REQUEST_RESPONSE_DEBOUNCE_MS = 2000;
   const PANEL_COLORS = {
     bg: 'rgba(17,13,12,.96)',
     bgSoft: 'rgba(24,18,17,.72)',
@@ -45,10 +54,24 @@
   const LIVE_DAMAGE_EVENT_TYPES = new Set(['damage', 'spell_damage']);
   const LIVE_HEALING_EVENT_TYPES = new Set(['healing', 'heal']);
   const processedBridgeSnapshots = new Set();
+  const processedViewerBroadcasts = new Set();
   let autoCaptureTimer = null;
   let autoCaptureObserver = null;
+  let bridgeSnapshotObserver = null;
+  let viewerBroadcastObserver = null;
+  let viewerChatObserver = null;
+  let viewerHeartbeatTimer = null;
+  let viewerRequestTimer = null;
   let autoCaptureInFlight = false;
   let extensionContextInvalidated = false;
+  let cachedTabScope = '';
+  let cachedTabScopeUrlKey = '';
+  let currentRuntimeMode = 'gm';
+  let viewerModeLocked = false;
+  let gmLifecycleListenersStarted = false;
+  const viewerState = { broadcast: null, lastSeenAt: 0 };
+  const knownViewerWhisperTargets = new Map();
+  const lastViewerRequestRespondedAtByTarget = new Map();
 
   const liveMetricsState = {
     messageKeys: new Set(),
@@ -103,6 +126,146 @@
     return String(value || '').replace(/\s+/g, ' ').trim();
   }
 
+  function isRoll20TablePage() {
+    return /^\/editor(?:\/|$)/i.test(window.location.pathname || '');
+  }
+
+  function removePanel() {
+    document.getElementById(PANEL_ID)?.remove();
+  }
+
+  function normalizeStorageScopePart(value) {
+    return normalizeMappingKey(value).slice(0, 80);
+  }
+
+  function getRoll20TableStorageScope() {
+    return getRoll20TableStorageScopes()[0] || '';
+  }
+  function getRoll20DurableStorageScope() {
+    return getRoll20DurableStorageScopes()[0] || '';
+  }
+
+  function getTabScope() {
+    const urlKey = `${window.location.pathname || ''}${window.location.search || ''}`;
+    if (cachedTabScope && cachedTabScopeUrlKey === urlKey) return cachedTabScope;
+    const generated = normalizeStorageScopePart(`tab_${randomHex(8)}`)
+      || normalizeStorageScopePart(`tab_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`);
+    if (generated) {
+      cachedTabScope = generated;
+      cachedTabScopeUrlKey = urlKey;
+    }
+    return cachedTabScope;
+  }
+
+  function getRoll20TableStorageScopes() {
+    const scopes = [];
+    const gameId = normalizeText(getRoll20GameId()).replace(/[^a-zA-Z0-9_-]+/g, '_').replace(/^_+|_+$/g, '');
+    if (gameId) scopes.push(`game:${gameId}`);
+    const gameTitle = getRoll20GameTitle();
+    const titleKey = normalizeStorageScopePart(gameTitle);
+    if (titleKey && titleKey !== 'roll20' && !isPlaceholderGameTitle(gameTitle)) scopes.push(`title:${titleKey}`);
+    const tabScope = getTabScope();
+    if (tabScope) scopes.push(`tab:${tabScope}`);
+    return Array.from(new Set(scopes));
+  }
+  function getRoll20DurableStorageScopes() {
+    const scopes = [];
+    const gameId = normalizeText(getRoll20GameId()).replace(/[^a-zA-Z0-9_-]+/g, '_').replace(/^_+|_+$/g, '');
+    if (gameId) scopes.push(`game:${gameId}`);
+    const gameTitle = getRoll20GameTitle();
+    const titleKey = normalizeStorageScopePart(gameTitle);
+    if (titleKey && titleKey !== 'roll20' && !isPlaceholderGameTitle(gameTitle)) scopes.push(`title:${titleKey}`);
+    return Array.from(new Set(scopes));
+  }
+
+  function getScopedStorageKey(baseKey) {
+    const scope = getRoll20TableStorageScope();
+    return scope ? `${baseKey}:${scope}` : baseKey;
+  }
+
+  function getScopedStorageKeys(baseKey) {
+    const scopes = getRoll20TableStorageScopes();
+    return scopes.length ? scopes.map((scope) => `${baseKey}:${scope}`) : [baseKey];
+  }
+
+  function getScopedStorageKeysStrict(baseKey) {
+    const scopes = getRoll20TableStorageScopes();
+    return scopes.map((scope) => `${baseKey}:${scope}`);
+  }
+
+  function getConnectionStorageKeyForConnection(connection) {
+    const scope = normalizeText(connection?.roll20_scope_key);
+    if (scope.startsWith('tab:')) return getConnectionStorageKey();
+    if (scope) return `${CONNECTION_KEY}:${scope}`;
+    return getConnectionStorageKey();
+  }
+
+  function getConnectionStorageKey() {
+    const scope = getRoll20DurableStorageScope();
+    return scope ? `${CONNECTION_KEY}:${scope}` : '';
+  }
+
+  function getPendingPairingStorageKey() {
+    return getScopedStorageKey(PENDING_PAIRING_KEY);
+  }
+
+  function getLastSentStorageKey() {
+    return getScopedStorageKey(LAST_SENT_KEY);
+  }
+
+  function getMappingProfileStorageKey() {
+    return getScopedStorageKey(MAPPING_PROFILE_KEY);
+  }
+
+  function enrichConnectionWithCurrentTableScope(connection) {
+    if (!connection) return connection;
+    const existingScope = normalizeText(connection.roll20_scope_key);
+    const durableScope = getRoll20DurableStorageScope();
+    return {
+      ...connection,
+      roll20_game_id: connection.roll20_game_id || getRoll20GameId(),
+      roll20_game_title: connection.roll20_game_title || getRoll20GameTitle(),
+      roll20_scope_key: existingScope && !existingScope.startsWith('tab:')
+        ? existingScope
+        : (durableScope || ''),
+    };
+  }
+
+  function connectionMatchesCurrentTable(connection) {
+    if (!connection) return true;
+    const currentScopes = getRoll20DurableStorageScopes();
+    const connectionScope = normalizeText(connection.roll20_scope_key);
+    if (!currentScopes.length && connectionScope) return false;
+    if (connectionScope && currentScopes.includes(connectionScope)) return true;
+    const currentGameId = normalizeText(getRoll20GameId());
+    const connectionGameId = normalizeText(connection.roll20_game_id || connection.roll20GameId);
+    if (currentGameId && connectionGameId) return currentGameId === connectionGameId;
+    const currentTitle = normalizeStorageScopePart(getRoll20GameTitle());
+    const connectionTitle = normalizeStorageScopePart(connection.roll20_game_title || connection.roll20GameTitle);
+    if (!currentTitle || currentTitle === 'roll20') return false;
+    return Boolean(currentTitle && connectionTitle && currentTitle === connectionTitle);
+  }
+
+  async function getCurrentConnection() {
+    const scopedKeys = getRoll20DurableStorageScopes().map((scope) => `${CONNECTION_KEY}:${scope}`);
+    if (!scopedKeys.length) return null;
+    for (const key of scopedKeys) {
+      const connection = await getStorageValue(key);
+      if (connectionMatchesCurrentTable(connection)) return connection;
+    }
+    return null;
+  }
+
+  async function getFirstScopedStorageValue(baseKey) {
+    const scopedKeys = getScopedStorageKeysStrict(baseKey);
+    if (!scopedKeys.length) return null;
+    for (const key of scopedKeys) {
+      const value = await getStorageValue(key);
+      if (value != null) return value;
+    }
+    return null;
+  }
+
   function createEmptyLiveMetricTotals() {
     return {
       messages: 0,
@@ -143,6 +306,21 @@
     return null;
   }
 
+  function inferAmountAfterKeyword(rawText, keywordPattern) {
+    const text = normalizeText(rawText);
+    const matches = Array.from(text.matchAll(keywordPattern));
+    for (let index = 0; index < matches.length; ++index) {
+      const start = matches[index].index ?? 0;
+      const end = Math.min(matches[index + 1]?.index ?? text.length, start + 96);
+      const windowText = text.slice(start, end);
+      const numbers = Array.from(windowText.matchAll(/\b(\d{1,4})\b/g))
+        .map((match) => toSafeNumber(match[1]))
+        .filter((amount) => amount != null);
+      if (numbers.length) return numbers[numbers.length - 1];
+    }
+    return null;
+  }
+
   function inferRollNatural(rawText) {
     const text = normalizeText(rawText).toLowerCase();
     const naturalMatch = text.match(/\b(?:nat|natural|naturel|critique|critical)\s*(20|1)\b/i);
@@ -151,7 +329,50 @@
     return d20Match ? Number(d20Match[1]) : null;
   }
 
-  function inferLiveActionType(rawText, { damageTotal = null, healTotal = null, hasRoll = false } = {}) {
+  function hasRoll20AttackBreakdown(rawText) {
+    return /\battack\s+breakdown\b/i.test(normalizeText(rawText));
+  }
+
+  function hasRoll20DamageBreakdown(rawText) {
+    return /\bdamage\s+breakdown\b/i.test(normalizeText(rawText));
+  }
+
+  function inferRoll20BreakdownTotal(rawText, sectionPattern) {
+    const text = normalizeText(rawText);
+    const section = text.search(sectionPattern);
+    if (section < 0) return null;
+    const windowText = text.slice(section, section + 260);
+    const match = windowText.match(/\btotal\s+(\d{1,4})\b/i);
+    return toSafeNumber(match?.[1]);
+  }
+
+  function isExplicitDamageText(rawText) {
+    const text = normalizeText(rawText);
+    if (hasRoll20DamageBreakdown(text)) return true;
+    if (hasRoll20AttackBreakdown(text)) return false;
+    const damageTypes = 'acid|bludgeoning|cold|fire|force|lightning|necrotic|piercing|poison|psychic|radiant|slashing|thunder|acide|contondant|froid|feu|foudre|necrotique|nécrotique|perforant|psychique|tranchant|tonnerre';
+    return new RegExp(`\\b(?:critical\\s+damage|crit\\s+damage|damage\\s*(?:plus|:|\\d+d\\d+|${damageTypes})|(?:${damageTypes})\\s+damage|\\d{1,4}\\s*(?:damage|dmg|degats|dégâts))\\b`, 'i').test(text);
+  }
+
+  function isLikelyAttackActionText(rawText) {
+    const text = normalizeText(rawText);
+    return /\b(?:attack|attaque|to\s*hit|toucher|hit\s*roll|jet\s*d\s*attaque|shortbow|longbow|crossbow|bow|longsword|shortsword|greataxe|rapier|dagger|sword|axe|mace)\b/i.test(text);
+  }
+
+  function inferRoll20AttackCardTotal(rawText) {
+    const text = normalizeText(rawText);
+    const breakdownTotal = inferRoll20BreakdownTotal(text, /\battack\s+breakdown\b/i);
+    if (breakdownTotal != null && breakdownTotal >= 1 && breakdownTotal <= 60) return breakdownTotal;
+    if (isExplicitDamageText(text)) return null;
+    const match = text.match(/\bdamage\b\s+(?:(?:vex|nick|sap|slow|topple|cleave|graze|push|flex|hew)\s+)?((?:\d{1,3}\s*){1,2})(?:details?|détails?|\b|$)/i);
+    const totals = Array.from(String(match?.[1] || '').matchAll(/\d{1,3}/g))
+      .map((item) => toSafeNumber(item[0]))
+      .filter((item) => item != null && item >= 1 && item <= 60);
+    const total = totals.length ? totals[totals.length - 1] : null;
+    return total != null && total >= 1 && total <= 60 ? total : null;
+  }
+
+  function inferLiveActionType(rawText, { damageTotal = null, healTotal = null, hasRoll = false, attackCardTotal = null } = {}) {
     const text = normalizeText(rawText);
     const hasSpell = /\b(?:spell|sort|sortilege|cantrip)\b/i.test(text);
     const hasDamage = damageTotal != null || /\b(?:damage|dmg|degats)\b/i.test(text);
@@ -159,7 +380,7 @@
     const hasInitiative = /\binitiative\b/i.test(text);
     const hasSavingThrow = /\b(?:saving\s*throw|sauvegarde|save|dex\s*save|str\s*save|con\s*save|int\s*save|wis\s*save|cha\s*save|fortitude|reflex|will)\b/i.test(text);
     const hasSkillCheck = /\b(?:skill\s*check|ability\s*check|competence|acrobatics|athletics|arcana|history|investigation|nature|religion|insight|medicine|perception|survival|deception|intimidation|performance|persuasion|stealth|sleight\s*of\s*hand)\b/i.test(text);
-    const hasAttackCue = /\b(?:attack|attaque|to\s*hit|toucher|hit\s*roll|jet\s*d\s*attaque)\b/i.test(text);
+    const hasAttackCue = attackCardTotal != null || /\b(?:attack|attaque|to\s*hit|toucher|hit\s*roll|jet\s*d\s*attaque)\b/i.test(text);
 
     // Certaines cartes Roll20 combinent "attaque" et "degats" dans le meme bloc.
     // Pour le kikimeter, on privilegie le type attaque quand un jet d20 d'attaque est present.
@@ -236,18 +457,23 @@
     const text = normalizeText(rawText);
     const rollNatural = inferRollNatural(text);
     const totalMatch = text.match(/\b(?:total|result|resultat)\D{0,12}(\d{1,3})\b/i);
-    const damageTotal = inferAmountFromText(text, [
-      /\b(?:damage|dmg|degats)\D{0,16}(\d{1,4})\b/i,
-      /\b(\d{1,4})\s*(?:damage|dmg|degats)\b/i,
-    ]);
-    const healTotal = inferAmountFromText(text, [
-      /\b(?:heal|healing|soin|soins|soigne)\D{0,16}(\d{1,4})\b/i,
-      /\b(\d{1,4})\s*(?:heal|healing|soin|soins)\b/i,
-    ]);
+    const attackCardTotal = inferRoll20AttackCardTotal(text);
+    const damageTotal = attackCardTotal == null
+      ? inferAmountAfterKeyword(text, /\b(?:critical\s+damage|crit\s+damage|damage|dmg|degats)(?![a-z])/gi)
+        ?? inferAmountFromText(text, [
+          /\b(?:damage|dmg|degats)\D{0,24}(\d{1,4})\b/i,
+          /\b(\d{1,4})\s*(?:damage|dmg|degats)\b/i,
+        ])
+      : null;
+    const healTotal = inferAmountAfterKeyword(text, /\b(?:heal|healing|soin|soins|soigne)(?![a-z])/gi)
+      ?? inferAmountFromText(text, [
+        /\b(?:heal|healing|soin|soins|soigne)\D{0,24}(\d{1,4})\b/i,
+        /\b(\d{1,4})\s*(?:heal|healing|soin|soins)\b/i,
+      ]);
     const explicitRollTotal = toSafeNumber(totalMatch?.[1]);
-    const hasRoll = /\b(?:d20|1d20|jet|roll|resultat|total)\b/i.test(text) || rollNatural != null || explicitRollTotal != null;
-    const actionType = inferLiveActionType(text, { damageTotal, healTotal, hasRoll });
-    const rollTotal = explicitRollTotal ?? inferStandaloneRollTotal(text, actionType);
+    const hasRoll = /\b(?:d20|1d20|jet|roll|resultat|total)\b/i.test(text) || rollNatural != null || explicitRollTotal != null || attackCardTotal != null;
+    const actionType = inferLiveActionType(text, { damageTotal, healTotal, hasRoll, attackCardTotal });
+    const rollTotal = explicitRollTotal ?? attackCardTotal ?? inferStandaloneRollTotal(text, actionType);
     return {
       actionType,
       rollNatural,
@@ -291,8 +517,114 @@
       .filter(Boolean);
   }
 
+  function getNodeReadableText(node) {
+    const visibleText = normalizeText(node?.innerText);
+    const domText = normalizeText(node?.textContent);
+    if (visibleText && domText && visibleText !== domText) return `${visibleText} ${domText}`;
+    return visibleText || domText;
+  }
+
   function isGmSpeakerLabel(value) {
     return /\b(?:gm|mj|game\s*master|maitre\s*du\s*jeu|maître\s*du\s*jeu|dungeon\s*master|dm)\b/i.test(normalizeSpeakerLabel(value));
+  }
+
+  function findCurrentRoll20PlayerNode() {
+    return document.querySelector(
+      '.player.me, .player[data-current="true"], .player[data-is-self="true"], .player[data-mine="true"], .player[data-is_self="true"]'
+    );
+  }
+
+  function getOwnSpeakingAsLabel() {
+    // Le dropdown "En tant que" / "Speaking as" expose toujours une option
+    // value="player|<monUserId>" text="<mon nom>". Roll20 suffixe ce texte par
+    // "(GM)" (ou "(MJ)" en FR) si le user connecte est le MJ. C'est le signal
+    // le plus stable pour distinguer MJ et joueur sans dependre du chat ni des
+    // tuiles video (dont le textContent inclut le label "Rejoindre le chat audio
+    // et video" qui pollue la lecture).
+    const options = document.querySelectorAll('#speakingas option');
+    for (const opt of options) {
+      if (String(opt.value || '').startsWith('player|')) {
+        return normalizeText(opt.textContent);
+      }
+    }
+    return '';
+  }
+
+  function normalizeRoll20PlayerLabel(value) {
+    return normalizeText(value).replace(/\s*\((?:gm|mj)\)\s*$/i, '').trim();
+  }
+
+  function getCurrentRoll20PlayerLabel() {
+    const speakingAs = normalizeRoll20PlayerLabel(getOwnSpeakingAsLabel());
+    if (speakingAs) return speakingAs;
+    const meNode = findCurrentRoll20PlayerNode();
+    const ownName = normalizeRoll20PlayerLabel(
+      meNode?.querySelector?.('.player-name')?.textContent
+        || meNode?.querySelector?.('.display-name')?.textContent
+        || meNode?.textContent
+        || ''
+    );
+    if (ownName && ownName.length < 80) return ownName;
+    return '';
+  }
+
+  function normalizeViewerWhisperTarget(value) {
+    const label = normalizeRoll20PlayerLabel(value)
+      .replace(/[<>]/g, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+    if (!label || label.length > 80) return '';
+    if (label.includes(VIEWER_BROADCAST_MARKER) || label.includes(BRIDGE_SNAPSHOT_MARKER)) return '';
+    return label;
+  }
+
+  function rememberViewerWhisperTarget(value) {
+    const label = normalizeViewerWhisperTarget(value);
+    if (!label) return '';
+    knownViewerWhisperTargets.set(label.toLowerCase(), label);
+    return label;
+  }
+
+  function getKnownViewerWhisperTargets() {
+    return Array.from(knownViewerWhisperTargets.values());
+  }
+
+  function buildRoll20WhisperCommand(targetLabel, message) {
+    const target = normalizeViewerWhisperTarget(targetLabel);
+    const body = normalizeText(message);
+    if (!target || !body) return '';
+    if (/^gm$/i.test(target)) return `/w gm ${body}`;
+    return `/w "${target.replace(/"/g, '')}" ${body}`;
+  }
+
+  function isCurrentUserRoll20Gm() {
+    return getCurrentRoll20ModeInfo().mode === 'gm';
+  }
+
+  function getCurrentRoll20ModeInfo() {
+    // 1. Marker legacy si Roll20 le re-expose un jour.
+    const meLegacy = findCurrentRoll20PlayerNode();
+    if (meLegacy?.matches?.('[data-is_gm="true"]')) return { mode: 'gm', confidence: 'strong', source: 'player-marker' };
+    if (meLegacy?.matches?.('[data-is_gm="false"]')) return { mode: 'viewer', confidence: 'strong', source: 'player-marker' };
+
+    // 2. Signal principal : nom du user dans le dropdown speakingas, suffixe (GM)/(MJ) si MJ.
+    const mySpeakingAsLabel = getOwnSpeakingAsLabel();
+    if (mySpeakingAsLabel) {
+      return /\((?:gm|mj)\)/i.test(mySpeakingAsLabel)
+        ? { mode: 'gm', confidence: 'strong', source: 'speakingas' }
+        : { mode: 'viewer', confidence: 'strong', source: 'speakingas' };
+    }
+
+    // 3. Fallback : presence d'outils MJ exclusifs (decks).
+    if (document.querySelector('#deck-toolbox, #decks, [data-tab="decks"]')) return { mode: 'gm', confidence: 'weak', source: 'gm-tools' };
+
+    // 4. Aucune piste : on garde le comportement historique MJ par defaut
+    // pour ne jamais retirer le panneau complet a un MJ legitime sur DOM atypique.
+    return { mode: 'gm', confidence: 'fallback', source: 'default' };
+  }
+
+  function getCurrentRoll20Mode() {
+    return getCurrentRoll20ModeInfo().mode;
   }
 
   function getCurrentGmName() {
@@ -365,6 +697,21 @@
     return role.role === 'npc' || role.force_gm === true;
   }
 
+  function shouldKeepSpeakerAsHuman(profile, speaker) {
+    const label = normalizeSpeakerLabel(speaker);
+    if (!label || isSpeakerRoutedToGm(label)) return false;
+    const role = getProfileSpeakerRole(profile, label);
+    return role?.role === 'human' || isKnownHumanSpeakerLabel(label);
+  }
+
+  function routeDetectedSpeaker(profile, speaker) {
+    const label = normalizeSpeakerLabel(speaker);
+    if (!label || isGmSpeakerLabel(label) || /to\s*gm/i.test(label)) return getCurrentGmName();
+    if (shouldKeepSpeakerAsHuman(profile, label)) return label;
+    if (shouldRouteSpeakerToGm(profile, label) || isNpcOrMonsterSpeakerLabel(label)) return getCurrentGmName();
+    return getCurrentGmName();
+  }
+
   function getChatSender(node) {
     const selectors = [
       '[data-speaker]',
@@ -413,28 +760,25 @@
     return candidates.find(isRoll20SpeakerCandidate) || '';
   }
 
-  function getChatSpeaker(node, rawText) {
+  function getChatSpeaker(node, rawText, mappingProfile = currentMappingProfile) {
     const sender = getChatSender(node);
     const rollCardSpeaker = getRollCardSpeaker(node, rawText);
     // Cas clef: message whisper/to GM.
-    // - Si la carte identifie un speaker non GM: garder ce speaker (PJ) sauf s'il est NPC/monstre.
-    // - Si c'est NPC/monstre, router vers GM pour fusionner sur la ligne GM.
+    // - Si la carte identifie un speaker human cote RollCodex ou joueur Roll20 connecte: garder ce speaker.
+    // - Sinon, router vers GM pour fusionner PNJ/monstres et inconnus sur la ligne GM.
     if (isGmSpeakerLabel(sender) || /to\s*gm/i.test(sender || '')) {
       if (rollCardSpeaker && !isGmSpeakerLabel(rollCardSpeaker) && !/to\s*gm/i.test(rollCardSpeaker)) {
-        if (isNpcOrMonsterSpeakerLabel(rollCardSpeaker) || !isKnownHumanSpeakerLabel(rollCardSpeaker)) return getCurrentGmName();
-        return rollCardSpeaker;
+        return routeDetectedSpeaker(mappingProfile, rollCardSpeaker);
       }
       return getCurrentGmName();
     }
 
     if (sender) {
-      if (isNpcOrMonsterSpeakerLabel(sender) || !isKnownHumanSpeakerLabel(sender)) return getCurrentGmName();
-      return sender;
+      return routeDetectedSpeaker(mappingProfile, sender);
     }
 
     if (rollCardSpeaker) {
-      if (isNpcOrMonsterSpeakerLabel(rollCardSpeaker) || !isKnownHumanSpeakerLabel(rollCardSpeaker)) return getCurrentGmName();
-      return rollCardSpeaker;
+      return routeDetectedSpeaker(mappingProfile, rollCardSpeaker);
     }
 
     return normalizeSpeakerLabel(getSpeakerFromText(rawText)) || 'Roll20';
@@ -625,10 +969,15 @@
     };
   }
 
+  function refreshActivePanel(status = '') {
+    if (currentRuntimeMode === 'viewer') return refreshViewerPanel(status);
+    return refreshPanel(status);
+  }
+
   async function setKikimeterMetric(metricId) {
     const nextMetricId = normalizeKikimeterMetricId(metricId);
     await setStorageValues({ [KIKIMETER_SETTINGS_KEY]: { metric_id: nextMetricId } });
-    refreshPanel(nextMetricId ? 'Kikimeter mis a jour' : 'Kikimeter sans mesure');
+    refreshActivePanel(nextMetricId ? 'Kikimeter mis a jour' : 'Kikimeter sans mesure');
   }
 
   function getNextPanelPosition(position) {
@@ -673,6 +1022,10 @@
       `background:${collapsed ? PANEL_COLORS.bgCollapsed : PANEL_COLORS.bg}`,
       `color:${PANEL_COLORS.text}`,
       'font:12px/1.4 Arial,sans-serif',
+      'letter-spacing:0',
+      'text-shadow:none',
+      'text-decoration:none',
+      'isolation:isolate',
       `box-shadow:${collapsed ? '0 8px 22px rgba(0,0,0,.2)' : '0 12px 34px rgba(0,0,0,.38)'}`,
       collapsed ? 'backdrop-filter:saturate(120%) blur(2px)' : '',
       collapsed ? 'cursor:grab' : '',
@@ -687,6 +1040,10 @@
     const bytes = new Uint8Array(byteLength);
     crypto.getRandomValues(bytes);
     return bytesToHex(bytes);
+  }
+
+  function buildConnectionSecret() {
+    return `rcx_roll20_${randomHex(32)}`;
   }
 
   async function sha256Hex(value) {
@@ -714,7 +1071,12 @@
   }
 
   function isPlaceholderGameTitle(value) {
-    return /^(roll20|loading|chargement|campagne|campaign)$/i.test(normalizeText(value));
+    const normalized = normalizeText(value).toLowerCase();
+    if (!normalized) return true;
+    if (/^(roll20|loading|chargement|campagne|campaign)$/.test(normalized)) return true;
+    if (/\b(virtual tabletop|online tabletop|play d&d|play dnd|character sheet|lfg)\b/.test(normalized)) return true;
+    if (/\bapp\.roll20\.net\b/.test(normalized)) return true;
+    return false;
   }
 
   function isPlaceholderConnectionLabel(value) {
@@ -801,6 +1163,55 @@
       'font-size:10px',
       'line-height:1.1',
       'box-shadow:inset 0 1px 0 rgba(255,255,255,.06),0 3px 8px rgba(0,0,0,.14)',
+    ].join(';');
+  }
+
+  function panelBrandStyle() {
+    return [
+      'display:block',
+      'min-width:0',
+      'flex:1 1 auto',
+      'overflow:hidden',
+      'text-overflow:ellipsis',
+      'white-space:nowrap',
+      `color:${PANEL_COLORS.text}`,
+      'background:transparent',
+      'border:0',
+      'padding:0',
+      'margin:0',
+      'font:700 12px/1 Arial,sans-serif',
+      'letter-spacing:0',
+      'text-shadow:none',
+      'text-decoration:none',
+      '-webkit-text-stroke:0',
+      'filter:none',
+      'box-shadow:none',
+    ].join(';');
+  }
+
+  function panelReaderBadgeStyle() {
+    return [
+      `color:${PANEL_COLORS.muted}`,
+      'font:700 9px/1 Arial,sans-serif',
+      'padding:2px 5px',
+      `border:1px solid ${PANEL_COLORS.borderSoft}`,
+      'border-radius:4px',
+      'letter-spacing:.04em',
+      'text-transform:uppercase',
+      'white-space:nowrap',
+      'flex:0 0 auto',
+    ].join(';');
+  }
+
+  function panelStatusBadgeStyle(connection) {
+    return [
+      `color:${connection ? PANEL_COLORS.ok : PANEL_COLORS.muted}`,
+      'font:700 10px/1 Arial,sans-serif',
+      'min-width:0',
+      'max-width:112px',
+      'overflow:hidden',
+      'text-overflow:ellipsis',
+      'white-space:nowrap',
     ].join(';');
   }
 
@@ -900,7 +1311,7 @@
 
   function getMetricProfileStatus(profile, connection) {
     if (!connection) return 'Connexion RollCodex requise';
-    if (!connection.mapping_profile_endpoint) return 'Profil RollCodex non synchronise';
+    if (!connection.mapping_profile_endpoint && !connection.is_viewer) return 'Profil RollCodex non synchronise';
     if (!profile?.schema_version) return 'Profil RollCodex indisponible';
     const metricCount = Array.isArray(profile.metrics)
       ? profile.metrics.length
@@ -1124,6 +1535,51 @@
     return bucket.count;
   }
 
+  function mergeBaselineAndLiveMetric(metric, family, baselineValue, baselineCount, liveStats) {
+    const safeBaselineValue = Number(baselineValue) || 0;
+    const safeBaselineCount = Number(baselineCount) || 0;
+    if (family.isAdditive) {
+      const liveValue = bucketValueForMetric(liveStats, metric);
+      return {
+        value: safeBaselineValue + liveValue,
+        delta: liveValue,
+        count: safeBaselineCount + (Number(liveStats?.messages) || Number(liveStats?.count) || 0),
+      };
+    }
+
+    if (family.isAverage) {
+      const liveCount = Number(liveStats?.count) || 0;
+      if (liveCount <= 0) {
+        return { value: safeBaselineValue, delta: 0, count: safeBaselineCount };
+      }
+      const totalCount = safeBaselineCount + liveCount;
+      const value = totalCount > 0
+        ? ((safeBaselineValue * safeBaselineCount) + (Number(liveStats?.sum) || 0)) / totalCount
+        : bucketValueForMetric(liveStats, metric);
+      return { value, delta: value - safeBaselineValue, count: totalCount };
+    }
+
+    if (family.isPercent) {
+      const liveDenominator = Number(liveStats?.denominator) || 0;
+      if (liveDenominator <= 0) {
+        return { value: safeBaselineValue, delta: 0, count: safeBaselineCount };
+      }
+      const totalDenominator = safeBaselineCount + liveDenominator;
+      const baselineNumerator = safeBaselineCount > 0 ? (safeBaselineValue / 100) * safeBaselineCount : 0;
+      const value = totalDenominator > 0
+        ? ((baselineNumerator + (Number(liveStats?.numerator) || 0)) / totalDenominator) * 100
+        : bucketValueForMetric(liveStats, metric);
+      return { value, delta: value - safeBaselineValue, count: totalDenominator };
+    }
+
+    const liveValue = bucketValueForMetric(liveStats, metric);
+    return {
+      value: safeBaselineValue + liveValue,
+      delta: liveValue,
+      count: safeBaselineCount + (Number(liveStats?.messages) || Number(liveStats?.count) || 0),
+    };
+  }
+
   function computeLiveDeltaForMetric(profile, metric) {
     const buckets = new Map();
     const totals = { count: 0, sum: 0, numerator: 0, denominator: 0, messages: 0 };
@@ -1174,10 +1630,11 @@
     const { buckets, totals } = computeLiveDeltaForMetric(profile, metric);
     const family = metricAggregationFamily(metric);
 
-    const liveValue = bucketValueForMetric(totals, metric);
     const baselineValue = Number(baselineResult?.value) || 0;
-    const totalDelta = family.isAdditive ? liveValue : (liveValue - baselineValue);
-    const mergedValue = baselineValue + totalDelta;
+    const baselineCount = Number(baselineResult?.count) || 0;
+    const mergedGlobal = mergeBaselineAndLiveMetric(metric, family, baselineValue, baselineCount, totals);
+    const totalDelta = mergedGlobal.delta;
+    const mergedValue = mergedGlobal.value;
     const hasDelta = Math.abs(totalDelta) > 0.01 || totals.messages > 0;
     const deltaLabel = Math.abs(totalDelta) > 0.01
       ? `${totalDelta > 0 ? '+' : '-'}${formatMetricValue(Math.abs(totalDelta), metric)}`
@@ -1187,7 +1644,7 @@
       label: family.isAdditive
         ? formatMetricValue(mergedValue, metric)
         : formatMetricValue(mergedValue, metric),
-      count: (Number(baselineResult?.count) || 0) + totals.messages,
+      count: mergedGlobal.count,
       delta_value: totalDelta,
       delta_label: deltaLabel,
       delta_count: totals.messages,
@@ -1203,33 +1660,38 @@
         sourceLabel: entry.sourceLabel || entry.label,
         mapped: entry.mapped !== false,
         baseline_value: Number(entry.value) || 0,
+        baseline_count: Number(entry.count) || 0,
         baseline_label: entry.value_label || formatMetricValue(Number(entry.value) || 0, metric),
         delta_value: 0,
         delta_messages: 0,
+        merged_count: Number(entry.count) || 0,
       });
     });
 
     for (const [bucketKey, bucket] of buckets.entries()) {
-      const liveBucketValue = bucketValueForMetric(bucket, metric);
-
       let entry = merged.get(bucketKey);
       if (!entry) {
         const matched = findBaselineEntryForBucket(Array.from(merged.values()), bucket);
         if (matched) entry = matched;
       }
       if (entry) {
-        entry.delta_value = family.isAdditive ? liveBucketValue : (liveBucketValue - entry.baseline_value);
+        const mergedEntry = mergeBaselineAndLiveMetric(metric, family, entry.baseline_value, entry.baseline_count, bucket);
+        entry.delta_value = mergedEntry.delta;
         entry.delta_messages = bucket.messages;
+        entry.merged_count = mergedEntry.count;
       } else {
+        const mergedBucket = mergeBaselineAndLiveMetric(metric, family, 0, 0, bucket);
         merged.set(bucketKey, {
           key: bucketKey,
           label: bucket.label,
           sourceLabel: bucket.sourceLabel,
           mapped: bucket.mapped,
           baseline_value: 0,
+          baseline_count: 0,
           baseline_label: '',
-          delta_value: liveBucketValue,
+          delta_value: mergedBucket.value,
           delta_messages: bucket.messages,
+          merged_count: mergedBucket.count,
         });
       }
     }
@@ -1380,9 +1842,56 @@
     return pageTitle && !isPlaceholderGameTitle(pageTitle) ? pageTitle : 'Roll20';
   }
 
+  function extractRoll20CampaignIdFromUrl(value) {
+    const text = String(value || '').trim();
+    if (!text) return '';
+    const detailsMatch = text.match(/\/campaigns\/details\/(\d{4,})/i);
+    if (detailsMatch?.[1]) return detailsMatch[1];
+    const editorMatch = text.match(/\/editor\/(\d{4,})/i);
+    if (editorMatch?.[1]) return editorMatch[1];
+    const queryMatch = text.match(/[?&](?:campaign_id|campaignId|game_id|gameId)=(\d{4,})/i);
+    return queryMatch?.[1] || '';
+  }
+
   function getRoll20GameId() {
-    const match = String(window.location.href).match(/campaigns\/details\/(\d+)|\/editor\/(\d+)/i);
-    return match?.[1] || match?.[2] || '';
+    const directLocationId = extractRoll20CampaignIdFromUrl(window.location.href);
+    if (directLocationId) return directLocationId;
+
+    const referrerId = extractRoll20CampaignIdFromUrl(document.referrer);
+    if (referrerId) return referrerId;
+
+    const selectors = [
+      '[data-campaign-id]',
+      '[data-campaignid]',
+      '[data-campaign_id]',
+      '[data-game-id]',
+      '[data-gameid]',
+      '[data-game_id]',
+    ];
+    for (const selector of selectors) {
+      const node = document.querySelector(selector);
+      const value = normalizeText(node?.getAttribute('data-campaign-id')
+        || node?.getAttribute('data-campaignid')
+        || node?.getAttribute('data-campaign_id')
+        || node?.getAttribute('data-game-id')
+        || node?.getAttribute('data-gameid')
+        || node?.getAttribute('data-game_id'));
+      if (/^\d{3,}$/.test(value)) return value;
+    }
+
+    const linkSelectors = [
+      'a[href*="/campaigns/details/"]',
+      'link[rel="canonical"]',
+      'meta[property="og:url"]',
+    ];
+    for (const selector of linkSelectors) {
+      const node = document.querySelector(selector);
+      const candidate = normalizeText(node?.getAttribute('href') || node?.getAttribute('content'));
+      const candidateId = extractRoll20CampaignIdFromUrl(candidate);
+      if (candidateId) return candidateId;
+    }
+
+    return '';
   }
 
   function isAllowedRollCodexConfirmation(command) {
@@ -1399,7 +1908,13 @@
   function isAllowedBridgeCommand(command) {
     const normalized = normalizeCommand(command);
     if (!normalized.startsWith(BRIDGE_COMMAND_PREFIX)) return false;
-    return /^!rollcodex bridge (ready|ack|fail)(\s|$)/i.test(normalized);
+    return /^!rollcodex bridge (ready|ack|fail|viewer)(\s|$)/i.test(normalized);
+  }
+
+  function isAllowedRollCodexViewerWhisper(command) {
+    const normalized = normalizeCommand(command);
+    if (!normalized.includes(VIEWER_BROADCAST_MARKER)) return false;
+    return /^\/w\s+(?:gm|"[^"\r\n]{1,80}"|[^\s\r\n]{1,80})\s+ROLLCODEX_BRIDGE_VIEWER:/i.test(normalized);
   }
 
   function isAllowedRollCodexActionCommand(command) {
@@ -1411,6 +1926,7 @@
   function isAllowedRollCodexChatCommand(command) {
     return isAllowedRollCodexConfirmation(command)
       || isAllowedBridgeCommand(command)
+      || isAllowedRollCodexViewerWhisper(command)
       || isAllowedRollCodexActionCommand(command);
   }
 
@@ -1470,16 +1986,21 @@
   async function togglePanelCollapsed() {
     const settings = await getPanelSettings();
     await patchPanelSettings({ collapsed: !settings.collapsed });
-    refreshPanel(settings.collapsed ? 'Panneau ouvert' : 'Panneau reduit');
+    refreshActivePanel(settings.collapsed ? 'Panneau ouvert' : 'Panneau reduit');
   }
 
   async function cyclePanelPosition() {
     const settings = await getPanelSettings();
     await patchPanelSettings({ position: getNextPanelPosition(settings.position) });
-    refreshPanel('Panneau deplace');
+    refreshActivePanel('Panneau deplace');
   }
 
   function renderPanel(state = {}) {
+    if (!isRoll20TablePage()) {
+      removePanel();
+      return;
+    }
+
     let panel = document.getElementById(PANEL_ID);
     if (!panel) {
       panel = document.createElement('div');
@@ -1516,7 +2037,7 @@
       <div style="display:grid;grid-template-columns:minmax(154px,170px) minmax(300px,1fr);gap:8px;align-items:start">
         <div style="min-width:0">
           <div data-rollcodex-panel-grip title="Glisser pour deplacer" style="display:flex;align-items:center;gap:6px;margin-bottom:5px;cursor:grab">
-            <div style="font-weight:700;min-width:0;flex:1">RollCodex</div>
+            <div data-rollcodex-panel-brand style="${panelBrandStyle()}">RollCodex</div>
             <span data-rollcodex-status title="${escapeHtml(status)}" style="color:${PANEL_COLORS.ok};font-size:10px;max-width:58px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(statusLabel)}</span>
             <button type="button" data-rollcodex-toggle-panel title="Reduire" style="${panelButtonStyle('secondary')};min-height:20px;min-width:22px;padding:1px 6px;font-size:12px;line-height:1">-</button>
           </div>
@@ -1551,6 +2072,89 @@
     panel.querySelector('[data-rollcodex-auto-plus]')?.addEventListener('click', () => adjustAutoIdle(5));
     panel.querySelector('[data-rollcodex-forget]')?.addEventListener('click', forgetExtensionConnection);
     panel.querySelector('[data-rollcodex-kiki-select]')?.addEventListener('change', (event) => setKikimeterMetric(event.target.value));
+  }
+
+  function renderViewerPanel(state = {}) {
+    if (!isRoll20TablePage()) {
+      removePanel();
+      return;
+    }
+
+    let panel = document.getElementById(PANEL_ID);
+    if (!panel) {
+      panel = document.createElement('div');
+      panel.id = PANEL_ID;
+      document.body.appendChild(panel);
+    }
+
+    const connection = state.connection || null;
+    const panelSettings = state.panelSettings || { collapsed: false, position: PANEL_POSITIONS[0] };
+    const kikimeterSettings = state.kikimeterSettings || { metric_id: '' };
+    const liveSummary = state.liveSummary || { totals: createEmptyLiveMetricTotals(), top_participants: [] };
+    const liveTotals = liveSummary.totals || createEmptyLiveMetricTotals();
+    const status = state.status || (connection ? 'Lecture session MJ' : 'Aucune session MJ');
+    const statusLabel = compactPanelStatus(status, connection);
+    const target = connection ? renderCompactConnectionTarget(connection) : escapeHtml('En attente du MJ');
+    const kikimeter = renderKikimeter(liveSummary, kikimeterSettings.metric_id);
+    const collapsedKikimeter = renderCollapsedKikimeter(liveSummary, kikimeterSettings.metric_id);
+    panel.style.cssText = getPanelCss(panelSettings);
+    panel.removeAttribute('title');
+    panel.onpointerdown = null;
+
+    if (panelSettings.collapsed) {
+      panel.innerHTML = `${collapsedKikimeter}`;
+      panel.title = 'Cliquer pour ouvrir, glisser pour deplacer';
+      panel.onpointerdown = (event) => beginPanelDrag(event, { onClick: togglePanelCollapsed, ignoreInteractive: false });
+      return;
+    }
+
+    panel.innerHTML = `
+      <div style="display:grid;grid-template-columns:minmax(154px,170px) minmax(300px,1fr);gap:8px;align-items:start">
+        <div style="min-width:0">
+          <div data-rollcodex-panel-grip title="Glisser pour deplacer" style="display:grid;grid-template-columns:minmax(0,1fr) 24px;gap:6px;align-items:center;margin-bottom:4px;cursor:grab">
+            <div data-rollcodex-panel-brand style="${panelBrandStyle()}">RollCodex</div>
+            <button type="button" data-rollcodex-toggle-panel title="Reduire" style="${panelButtonStyle('secondary')};min-height:20px;min-width:22px;padding:1px 6px;font-size:12px;line-height:1">-</button>
+          </div>
+          <div data-rollcodex-viewer-state-row style="display:flex;align-items:center;gap:6px;min-width:0;margin-bottom:5px;overflow:hidden">
+            <span title="Lecture seule - le MJ controle la session" style="${panelReaderBadgeStyle()}">Lecteur</span>
+            <span data-rollcodex-status title="${escapeHtml(status)}" style="${panelStatusBadgeStyle(connection)}">${escapeHtml(statusLabel)}</span>
+          </div>
+          <div title="${target}" style="margin-bottom:4px;color:${PANEL_COLORS.accent};min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px">${target}</div>
+          <div style="display:flex;gap:5px;flex-wrap:wrap;margin-bottom:6px;color:${PANEL_COLORS.muted};font-size:10px">
+            <span>${liveTotals.messages} msg</span>
+            <span>${liveTotals.rolls} jets</span>
+          </div>
+          <div style="color:${PANEL_COLORS.faint};font-size:10px;line-height:1.35">Session pilotee par le MJ. Aucune donnee n'est envoyee depuis votre navigateur.</div>
+        </div>
+        <div style="min-width:0">${kikimeter}</div>
+      </div>
+    `;
+    panel.querySelector('[data-rollcodex-panel-grip]')?.addEventListener('pointerdown', beginPanelDrag);
+    panel.querySelector('[data-rollcodex-toggle-panel]')?.addEventListener('click', togglePanelCollapsed);
+    panel.querySelector('[data-rollcodex-kiki-select]')?.addEventListener('change', (event) => setKikimeterMetric(event.target.value));
+  }
+
+  async function refreshViewerPanel(status = '') {
+    if (!isRoll20TablePage()) {
+      cleanupNonTablePage();
+      return;
+    }
+    const panelSettings = await getPanelSettings();
+    const kikimeterSettings = await getKikimeterSettings();
+    const broadcast = viewerState.broadcast;
+    const profile = broadcast?.profile || null;
+    const connection = broadcast?.connection ? { ...broadcast.connection, is_viewer: true } : null;
+    currentMappingProfile = profile;
+    const visibleMessages = getChatRows().map((node, index) => normalizeChatRow(node, index, profile)).filter(Boolean);
+    rebuildLiveMetricsFromMessages(dedupeNormalizedMessages(visibleMessages));
+    renderViewerPanel({
+      panelSettings,
+      kikimeterSettings,
+      connection,
+      profile,
+      liveSummary: summarizeLiveMetrics(profile, kikimeterSettings.metric_id, connection),
+      status: status || (broadcast ? 'Lecture session MJ' : 'En attente du MJ...'),
+    });
   }
 
   function updatePanelStatus(status) {
@@ -1617,7 +2221,11 @@
   }
 
   async function refreshPanel(status = '') {
-    const connection = await getStorageValue(CONNECTION_KEY);
+    if (!isRoll20TablePage()) {
+      cleanupNonTablePage();
+      return;
+    }
+    const connection = await getCurrentConnection();
     const autoSettings = await getAutoSettings();
     const panelSettings = await getPanelSettings();
     const kikimeterSettings = await getKikimeterSettings();
@@ -1660,16 +2268,19 @@
     updatePanelStatus('Preparation du jumelage...');
     const connectionId = buildUuid();
     const state = buildUuid();
-    const connectionSecret = randomHex(32);
+    const connectionSecret = buildConnectionSecret();
     const secretHash = await sha256Hex(connectionSecret);
     const pendingPairing = {
       connectionId,
       state,
       connectionSecret,
       secretHash,
+      roll20GameId: getRoll20GameId(),
+      roll20GameTitle: getRoll20GameTitle(),
+      roll20ScopeKey: getRoll20DurableStorageScope(),
       createdAt: new Date().toISOString(),
     };
-    await setStorageValues({ [PENDING_PAIRING_KEY]: pendingPairing });
+    await setStorageValues({ [getPendingPairingStorageKey()]: pendingPairing });
 
     const params = buildQueryString({
       connection_id: connectionId,
@@ -1714,6 +2325,7 @@
     const text = normalizeText(rawText);
     if (!text) return true;
     if (text.includes(BRIDGE_SNAPSHOT_MARKER) || text.includes('!rollcodex bridge')) return true;
+    if (text.includes(VIEWER_BROADCAST_MARKER)) return true;
 
     const lowerText = text.toLowerCase();
     const lowerSpeaker = normalizeText(speaker).toLowerCase();
@@ -1742,17 +2354,24 @@
   }
 
   function normalizeChatRow(node, index, mappingProfile = currentMappingProfile) {
-    const rawText = normalizeText(node.textContent);
+    const rawText = getNodeReadableText(node);
     const key = getChatRowKey(node, index, rawText);
     const sender = getChatSender(node);
-    let speaker = getChatSpeaker(node, rawText);
+    let speaker = getChatSpeaker(node, rawText, mappingProfile);
     if (isIgnoredChatText(rawText, speaker)) return null;
     if (isSystemChatMessage(rawText, speaker)) return null;
     const original_speaker = speaker;
     const gmName = getCurrentGmName();
-    const hadExplicitSpeaker = Boolean(sender || getRollCardSpeaker(node, rawText) || getSpeakerFromText(rawText));
+    const rollCardSpeaker = getRollCardSpeaker(node, rawText);
+    const hadExplicitSpeaker = Boolean(sender || rollCardSpeaker || getSpeakerFromText(rawText));
+    const figures = extractRollFigures(rawText);
+    const isFollowUpAmount = (figures.damageTotal != null || figures.healTotal != null)
+      && figures.rollTotal == null
+      && figures.rollNatural == null;
     // Carry-over speaker generique avant d'evaluer le routage.
-    if ((!speaker || speaker === 'Roll20') && lastResolvedChatSpeaker) {
+    const shouldCarryPreviousSpeaker = (!speaker || speaker === 'Roll20')
+      || (isSpeakerRoutedToGm(speaker) && !rollCardSpeaker && isFollowUpAmount);
+    if (shouldCarryPreviousSpeaker && lastResolvedChatSpeaker) {
       speaker = lastResolvedChatSpeaker;
     }
     // Regle :
@@ -1769,7 +2388,6 @@
     if (!speaker || speaker === 'Roll20') {
       speaker = gmName;
     }
-    const figures = extractRollFigures(rawText);
     // Séparation stricte attaque/dégâts :
     let actionType = figures.actionType;
     let rollTotal = figures.rollTotal;
@@ -1850,9 +2468,11 @@
   }
 
   // Déduplication GM/To GM et fusion des messages identiques (priorité GM)
-  async function collectExtensionMessages() {
-    const lastSentKey = await getStorageValue(LAST_SENT_KEY);
-    const messages = getChatRows().map((node, index) => normalizeChatRow(node, index)).filter(Boolean);
+  async function collectExtensionMessages(connectionOverride = null) {
+    const lastSentKey = await getFirstScopedStorageValue(LAST_SENT_KEY);
+    const connection = connectionOverride || await getCurrentConnection();
+    const profile = connection ? await getMappingProfile(connection).catch(() => currentMappingProfile) : currentMappingProfile;
+    const messages = getChatRows().map((node, index) => normalizeChatRow(node, index, profile)).filter(Boolean);
     const deduped = dedupeNormalizedMessages(messages);
     const pending = getPendingMessagesSlice(deduped, lastSentKey);
     // L'affichage live reste base sur les messages visibles, pas uniquement les pending.
@@ -1877,11 +2497,11 @@
         participant.rolls += 1;
         liveMetricsState.totals.rolls += 1;
       }
-      if (message.roll_natural_hint === 20) {
+      if (message.roll_natural_hint === 20 || message.is_critical_hint === true) {
         participant.criticals += 1;
         liveMetricsState.totals.criticals += 1;
       }
-      if (message.roll_natural_hint === 1) {
+      if (message.roll_natural_hint === 1 || message.is_fumble_hint === true) {
         participant.fumbles += 1;
         liveMetricsState.totals.fumbles += 1;
       }
@@ -1946,7 +2566,15 @@
   }
 
   function normalizeMappingKey(value) {
-    return normalizeText(value).toLowerCase();
+    // Doit etre strictement identique a normalizeMetricKey cote backend
+    // (supabase/functions/vtt-mapping-profile/index.ts) sinon les lookups
+    // speaker_roles / mappings echouent silencieusement.
+    return normalizeText(value)
+      .toLowerCase()
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .replace(/[^a-z0-9]+/g, '_')
+      .replace(/^_+|_+$/g, '');
   }
 
   function isFreshMappingProfileCache(stored, connectionId) {
@@ -1960,7 +2588,8 @@
       return null;
     }
 
-    const stored = await getStorageValue(MAPPING_PROFILE_KEY);
+    const mappingProfileKey = getMappingProfileStorageKey();
+    const stored = await getStorageValue(mappingProfileKey);
     if (!options.force && isFreshMappingProfileCache(stored, connection.connection_id)) {
       currentMappingProfile = stored.profile;
       return stored.profile;
@@ -1989,7 +2618,7 @@
       const previousLastUpdate = stored?.profile?.last_updated_at || null;
       const nextLastUpdate = profile.last_updated_at || null;
       await setStorageValues({
-        [MAPPING_PROFILE_KEY]: {
+        [mappingProfileKey]: {
           connection_id: connection.connection_id,
           fetched_at: new Date().toISOString(),
           profile,
@@ -2086,7 +2715,7 @@
     const silent = Boolean(options.silent);
     if (mode === 'auto' && autoCaptureInFlight) return;
     if (mode === 'auto') autoCaptureInFlight = true;
-    const connection = await getStorageValue(CONNECTION_KEY);
+    const connection = await getCurrentConnection();
     if (!connection?.endpoint) {
       if (!silent) updatePanelStatus('Connexion RollCodex manquante');
       if (mode === 'auto') autoCaptureInFlight = false;
@@ -2099,7 +2728,7 @@
         return;
       }
     }
-    const messages = await collectExtensionMessages();
+    const messages = await collectExtensionMessages(connection);
     if (!messages.length) {
       if (!skipIfEmpty && !silent) updatePanelStatus('Aucun nouveau message visible');
       if (mode === 'auto') autoCaptureInFlight = false;
@@ -2118,12 +2747,13 @@
       if (mode === 'auto') autoCaptureInFlight = false;
       return;
     }
-      await getMappingProfile(connection, { force: true }).catch(() => null);
-      await setStorageValues({ [LAST_SENT_KEY]: messages[messages.length - 1].key });
+      const refreshedProfile = await getMappingProfile(connection, { force: true }).catch(() => null);
+      await setStorageValues({ [getLastSentStorageKey()]: messages[messages.length - 1].key });
       if (mode === 'auto') {
         await patchAutoSettings({ lastAutoSentAt: Date.now() });
         autoCaptureInFlight = false;
       }
+      broadcastViewerSession(connection, refreshedProfile, `capture_${mode}`);
       if (!silent) updatePanelStatus(`${mode === 'auto' ? 'Auto-capture envoyee' : 'Capture envoyee'} (${messages.length} messages)`);
       refreshPanel();
   }
@@ -2143,9 +2773,16 @@
   }
 
   async function forgetExtensionConnection() {
-    await removeStorageValue(CONNECTION_KEY);
-    await removeStorageValue(PENDING_PAIRING_KEY);
-    await removeStorageValue(LAST_SENT_KEY);
+    const previousConnection = await getCurrentConnection();
+    if (previousConnection) broadcastViewerSessionCleared(previousConnection, 'gm_forget');
+    await Promise.all(getScopedStorageKeys(CONNECTION_KEY).map((key) => removeStorageValue(key).catch(() => null)));
+    await Promise.all(getScopedStorageKeys(PENDING_PAIRING_KEY).map((key) => removeStorageValue(key).catch(() => null)));
+    await Promise.all(getScopedStorageKeys(LAST_SENT_KEY).map((key) => removeStorageValue(key).catch(() => null)));
+    await Promise.all(getScopedStorageKeys(MAPPING_PROFILE_KEY).map((key) => removeStorageValue(key).catch(() => null)));
+    if (viewerHeartbeatTimer) {
+      window.clearInterval(viewerHeartbeatTimer);
+      viewerHeartbeatTimer = null;
+    }
     refreshPanel('Connexion oubliee');
   }
 
@@ -2155,10 +2792,53 @@
     autoCaptureTimer = null;
   }
 
+  function stopAutoCaptureObserver() {
+    if (!autoCaptureObserver) return;
+    autoCaptureObserver.disconnect();
+    autoCaptureObserver = null;
+  }
+
+  function stopBridgeSnapshotObserver() {
+    if (!bridgeSnapshotObserver) return;
+    bridgeSnapshotObserver.disconnect();
+    bridgeSnapshotObserver = null;
+  }
+
+  function stopViewerObservers() {
+    clearViewerRequestTimer();
+    if (viewerBroadcastObserver) {
+      viewerBroadcastObserver.disconnect();
+      viewerBroadcastObserver = null;
+    }
+    if (viewerChatObserver) {
+      viewerChatObserver.disconnect();
+      viewerChatObserver = null;
+    }
+    if (viewerHeartbeatTimer) {
+      window.clearInterval(viewerHeartbeatTimer);
+      viewerHeartbeatTimer = null;
+    }
+  }
+
+  function cleanupNonTablePage() {
+    document.removeEventListener('visibilitychange', handleVisibilityModeRecheck);
+    window.removeEventListener('focus', handleVisibilityModeRecheck);
+    clearAutoCaptureTimer();
+    stopGmLifecycleListeners();
+    stopAutoCaptureObserver();
+    stopBridgeSnapshotObserver();
+    stopViewerObservers();
+    removePanel();
+  }
+
   async function scheduleAutoSnapshot(reason = 'roll20_auto_idle') {
+    if (!isRoll20TablePage()) {
+      cleanupNonTablePage();
+      return;
+    }
     const settings = await getAutoSettings();
     if (!settings.enabled) return;
-    const connection = await getStorageValue(CONNECTION_KEY);
+    const connection = await getCurrentConnection();
     if (!connection?.endpoint) return;
     clearAutoCaptureTimer();
     autoCaptureTimer = window.setTimeout(() => {
@@ -2167,6 +2847,7 @@
   }
 
   function startAutoCaptureObserver() {
+    if (!isRoll20TablePage()) return;
     if (autoCaptureObserver) return;
     const root = document.querySelector('#textchat');
     if (!root) {
@@ -2189,6 +2870,10 @@
   }
 
   function sendVisibilitySnapshot() {
+    if (!isRoll20TablePage()) {
+      cleanupNonTablePage();
+      return;
+    }
     // Ne pas envoyer au simple changement de fenetre/onglet.
     // L'envoi auto doit rester pilote par l'inactivite (timer),
     // ou par les evenements de fermeture (pagehide/beforeunload),
@@ -2199,11 +2884,35 @@
   }
 
   function sendPagehideSnapshot() {
+    if (!isRoll20TablePage()) return;
     sendExtensionSnapshot({ mode: 'auto', reason: 'roll20_pagehide', skipIfEmpty: true, silent: true });
   }
 
   function sendBeforeUnloadSnapshot() {
+    if (!isRoll20TablePage()) return;
     sendExtensionSnapshot({ mode: 'auto', reason: 'roll20_beforeunload', skipIfEmpty: true, silent: true });
+  }
+
+  function startGmLifecycleListeners() {
+    if (gmLifecycleListenersStarted) return;
+    gmLifecycleListenersStarted = true;
+    document.addEventListener('visibilitychange', sendVisibilitySnapshot);
+    window.addEventListener('pagehide', sendPagehideSnapshot);
+    window.addEventListener('beforeunload', sendBeforeUnloadSnapshot);
+  }
+
+  function stopGmLifecycleListeners() {
+    if (!gmLifecycleListenersStarted) return;
+    gmLifecycleListenersStarted = false;
+    document.removeEventListener('visibilitychange', sendVisibilitySnapshot);
+    window.removeEventListener('pagehide', sendPagehideSnapshot);
+    window.removeEventListener('beforeunload', sendBeforeUnloadSnapshot);
+  }
+
+  function handleVisibilityModeRecheck() {
+    if (document.visibilityState && document.visibilityState !== 'visible') return;
+    window.setTimeout(() => reevaluateRuntimeMode('visibility'), 250);
+    window.setTimeout(() => reevaluateRuntimeMode('visibility-stable'), 1500);
   }
 
   function parseBridgeSnapshot(encoded) {
@@ -2250,21 +2959,389 @@
   }
 
   function startBridgeSnapshotObserver() {
+    if (!isRoll20TablePage()) return;
+    if (bridgeSnapshotObserver) return;
     scanBridgeSnapshots();
-    const observer = new MutationObserver((mutations) => {
+    bridgeSnapshotObserver = new MutationObserver((mutations) => {
       mutations.forEach((mutation) => {
         mutation.addedNodes.forEach((node) => scanBridgeSnapshots(node));
       });
     });
-    observer.observe(document.body, { childList: true, subtree: true });
+    bridgeSnapshotObserver.observe(document.body, { childList: true, subtree: true });
+  }
+
+  function sanitizeBroadcastProfile(profile) {
+    if (!profile) return null;
+    return {
+      schema_version: profile.schema_version || null,
+      last_updated_at: profile.last_updated_at || null,
+      metrics: Array.isArray(profile.metrics) ? profile.metrics : [],
+      mappings: Array.isArray(profile.mappings) ? profile.mappings : [],
+      speaker_roles: Array.isArray(profile.speaker_roles) ? profile.speaker_roles : [],
+    };
+  }
+
+  function buildViewerBroadcastPayload(connection, profile, extra = {}) {
+    if (!connection) return null;
+    return {
+      type: VIEWER_BROADCAST_TYPE,
+      version: 1,
+      emitted_at: new Date().toISOString(),
+      bridge_version: BRIDGE_VERSION,
+      connection: {
+        provider: 'roll20',
+        connection_id: connection.connection_id || '',
+        workspace_label: connection.workspace_label || '',
+        system_label: connection.system_label || '',
+        campaign_label: connection.campaign_label || '',
+        table_label: connection.table_label || '',
+        roll20_game_id: connection.roll20_game_id || '',
+        roll20_game_title: connection.roll20_game_title || '',
+        roll20_scope_key: connection.roll20_scope_key || '',
+      },
+      profile: sanitizeBroadcastProfile(profile),
+      ...extra,
+    };
+  }
+
+  function encodeViewerBroadcast(payload) {
+    return encodeURIComponent(JSON.stringify(payload));
+  }
+
+  function buildViewerBridgeMarker(payload) {
+    const encoded = encodeViewerBroadcast(payload);
+    const marker = `${VIEWER_BROADCAST_MARKER}${encoded}`;
+    if (marker.length <= VIEWER_BROADCAST_MAX_MARKER_LENGTH) {
+      return marker;
+    }
+    // Profil trop volumineux pour le chat Roll20 : on tronque metriques/mappings
+    // pour rester sous la limite. Le lecteur n'aura qu'une vue partielle mais
+    // utilisable (les premieres entrees sont les plus pertinentes par sort_order).
+    const trimmedProfile = payload.profile ? {
+      ...payload.profile,
+      metrics: (payload.profile.metrics || []).slice(0, 24),
+      mappings: (payload.profile.mappings || []).slice(0, 48),
+      speaker_roles: (payload.profile.speaker_roles || []).slice(0, 48),
+    } : null;
+    const trimmed = { ...payload, profile: trimmedProfile, truncated: true };
+    return `${VIEWER_BROADCAST_MARKER}${encodeViewerBroadcast(trimmed)}`;
+  }
+
+  function sendViewerBridgePayloadToTarget(payload, targetLabel) {
+    const marker = buildViewerBridgeMarker(payload);
+    const command = buildRoll20WhisperCommand(targetLabel, marker);
+    if (!command) return false;
+    const result = sendChatCommand(command);
+    return Boolean(result?.ok);
+  }
+
+  function broadcastViewerSession(connection, profile, reason = 'connection_update', options = {}) {
+    if (!isCurrentUserRoll20Gm()) return false;
+    if (!isRoll20TablePage()) return false;
+    const payload = buildViewerBroadcastPayload(connection, profile, { reason });
+    if (!payload) return false;
+    const explicitTarget = normalizeViewerWhisperTarget(options.targetLabel || '');
+    const targets = explicitTarget ? [explicitTarget] : getKnownViewerWhisperTargets();
+    if (!targets.length) return false;
+    return targets.some((target) => sendViewerBridgePayloadToTarget(payload, target));
+  }
+
+  function broadcastViewerSessionCleared(connection, reason = 'gm_disconnected', options = {}) {
+    if (!isCurrentUserRoll20Gm()) return false;
+    if (!connection) return false;
+    const payload = {
+      type: VIEWER_BROADCAST_TYPE,
+      version: 1,
+      emitted_at: new Date().toISOString(),
+      cleared: true,
+      reason,
+      connection: {
+        provider: 'roll20',
+        connection_id: connection.connection_id || '',
+        roll20_game_id: connection.roll20_game_id || '',
+        roll20_game_title: connection.roll20_game_title || '',
+        roll20_scope_key: connection.roll20_scope_key || '',
+      },
+    };
+    const explicitTarget = normalizeViewerWhisperTarget(options.targetLabel || '');
+    const targets = explicitTarget ? [explicitTarget] : getKnownViewerWhisperTargets();
+    knownViewerWhisperTargets.clear();
+    lastViewerRequestRespondedAtByTarget.clear();
+    if (!targets.length) return false;
+    return targets.some((target) => sendViewerBridgePayloadToTarget(payload, target));
+  }
+
+  function scheduleViewerHeartbeat() {
+    if (!isCurrentUserRoll20Gm()) return;
+    if (viewerHeartbeatTimer) window.clearInterval(viewerHeartbeatTimer);
+    viewerHeartbeatTimer = window.setInterval(async () => {
+      if (!isRoll20TablePage()) return;
+      const connection = await getCurrentConnection();
+      if (!connection) return;
+      const profile = await getMappingProfile(connection).catch(() => null);
+      broadcastViewerSession(connection, profile, 'heartbeat');
+    }, VIEWER_BROADCAST_HEARTBEAT_MS);
+  }
+
+  function decodeViewerBroadcast(encoded) {
+    try {
+      const payload = JSON.parse(decodeURIComponent(String(encoded || '').trim()));
+      if (payload?.type !== VIEWER_BROADCAST_TYPE && payload?.type !== VIEWER_REQUEST_TYPE) return null;
+      return payload;
+    } catch (_error) {
+      return null;
+    }
+  }
+
+  function buildViewerRequestPayload() {
+    return {
+      type: VIEWER_REQUEST_TYPE,
+      version: 1,
+      requested_at: new Date().toISOString(),
+      token: randomHex(8),
+      requester_label: getCurrentRoll20PlayerLabel(),
+      roll20_scope_key: getRoll20DurableStorageScope(),
+      roll20_game_id: getRoll20GameId(),
+      roll20_game_title: getRoll20GameTitle(),
+    };
+  }
+
+  function sendViewerBroadcastRequest() {
+    if (isCurrentUserRoll20Gm()) return false;
+    if (!isRoll20TablePage()) return false;
+    const payload = buildViewerRequestPayload();
+    const marker = `${VIEWER_BROADCAST_MARKER}${encodeViewerBroadcast(payload)}`;
+    const result = sendChatCommand(buildRoll20WhisperCommand('gm', marker));
+    return Boolean(result?.ok);
+  }
+
+  function clearViewerRequestTimer() {
+    if (!viewerRequestTimer) return;
+    window.clearInterval(viewerRequestTimer);
+    viewerRequestTimer = null;
+  }
+
+  function scheduleViewerBroadcastRequests() {
+    VIEWER_REQUEST_RETRY_DELAYS_MS.forEach((delay) => {
+      window.setTimeout(() => {
+        if (!isRoll20TablePage()) return;
+        if (currentRuntimeMode !== 'viewer') return;
+        if (viewerState.broadcast) return;
+        sendViewerBroadcastRequest();
+      }, delay);
+    });
+    if (viewerRequestTimer) return;
+    viewerRequestTimer = window.setInterval(() => {
+      if (!isRoll20TablePage() || currentRuntimeMode !== 'viewer') {
+        clearViewerRequestTimer();
+        return;
+      }
+      if (viewerState.broadcast) {
+        clearViewerRequestTimer();
+        return;
+      }
+      sendViewerBroadcastRequest();
+    }, VIEWER_REQUEST_PERIODIC_MS);
+  }
+
+  async function handleViewerRequest(payload) {
+    if (!isCurrentUserRoll20Gm()) return;
+    // Le MJ ne repond qu'aux requetes scopees sur sa propre table active.
+    const requestScope = String(payload?.roll20_scope_key || '').trim();
+    const currentScopes = getRoll20DurableStorageScopes();
+    if (requestScope && currentScopes.length && !currentScopes.includes(requestScope)) return;
+
+    // Debounce : evite une rafale de re-broadcasts si plusieurs joueurs ouvrent en meme temps.
+    const now = Date.now();
+    const requesterLabel = rememberViewerWhisperTarget(payload?.requester_label);
+    if (!requesterLabel) return;
+    const requesterKey = requesterLabel.toLowerCase();
+    const lastRespondedAt = lastViewerRequestRespondedAtByTarget.get(requesterKey) || 0;
+    if (now - lastRespondedAt < VIEWER_REQUEST_RESPONSE_DEBOUNCE_MS) return;
+    lastViewerRequestRespondedAtByTarget.set(requesterKey, now);
+
+    const connection = await getCurrentConnection();
+    if (!connection) return;
+    const profile = await getMappingProfile(connection).catch(() => null);
+    broadcastViewerSession(connection, profile, 'viewer_request', { targetLabel: requesterLabel });
+  }
+
+  function viewerBroadcastMatchesCurrentTable(payload, options = {}) {
+    const conn = payload?.connection;
+    if (!conn) return false;
+    const candidate = {
+      roll20_game_id: conn.roll20_game_id,
+      roll20_game_title: conn.roll20_game_title,
+      roll20_scope_key: conn.roll20_scope_key,
+    };
+    if (connectionMatchesCurrentTable(candidate)) return true;
+    if (!options.allowWeakChatRelay) return false;
+
+    // Le broadcast lecteur arrive via le chat Roll20 de cette table. Si Roll20
+    // masque l'id de campagne ou donne un titre divergent entre MJ et joueur,
+    // on accepte ce relais live tant qu'aucun identifiant fort ne contredit.
+    const currentGameId = normalizeText(getRoll20GameId());
+    const candidateGameId = normalizeText(candidate.roll20_game_id);
+    if (currentGameId && candidateGameId && currentGameId !== candidateGameId) return false;
+
+    const currentTitle = normalizeStorageScopePart(getRoll20GameTitle());
+    const candidateTitle = normalizeStorageScopePart(candidate.roll20_game_title);
+    if (currentTitle && candidateTitle && currentTitle !== 'roll20' && candidateTitle !== 'roll20' && currentTitle !== candidateTitle) {
+      return false;
+    }
+
+    return true;
+  }
+
+  function applyViewerBroadcast(payload, options = {}) {
+    if (!viewerBroadcastMatchesCurrentTable(payload, options)) return;
+    const emittedAt = Date.parse(payload?.emitted_at || '');
+    const stamp = Number.isFinite(emittedAt) ? emittedAt : Date.now();
+    if (stamp <= viewerState.lastSeenAt) return;
+    if (payload?.cleared === true) {
+      viewerState.broadcast = null;
+      viewerState.lastSeenAt = stamp;
+      removeStorageValue(VIEWER_BROADCAST_CACHE_KEY).catch(() => null);
+      refreshViewerPanel('Session MJ terminee');
+      scheduleViewerBroadcastRequests();
+      return;
+    }
+    viewerState.broadcast = payload;
+    viewerState.lastSeenAt = stamp;
+    clearViewerRequestTimer();
+    setStorageValues({
+      [VIEWER_BROADCAST_CACHE_KEY]: {
+        roll20_scope_key: payload.connection?.roll20_scope_key || '',
+        payload,
+        cached_at: new Date().toISOString(),
+      },
+    }).catch(() => null);
+    refreshViewerPanel(payload?.reason === 'heartbeat' ? 'Heartbeat MJ' : 'Mise a jour MJ');
+  }
+
+  function findViewerBridgeChatRow(node) {
+    const element = node?.nodeType === Node.ELEMENT_NODE ? node : node?.parentElement;
+    if (!element) return null;
+    return element.closest?.(
+      '#textchat [data-messageid], #textchat [data-message-id], #textchat .message, #textchat .textchatmessage, #textchat .chat-message'
+    );
+  }
+
+  function hideViewerBridgeChatRows(root = document.body) {
+    const element = root?.nodeType === Node.ELEMENT_NODE ? root : root?.parentElement;
+    if (!element) return;
+    const directRow = normalizeText(element.textContent).includes(VIEWER_BROADCAST_MARKER)
+      ? findViewerBridgeChatRow(element)
+      : null;
+    const rows = new Set(directRow ? [directRow] : []);
+    element.querySelectorAll?.(
+      '#textchat [data-messageid], #textchat [data-message-id], #textchat .message, #textchat .textchatmessage, #textchat .chat-message'
+    ).forEach((row) => {
+      if (normalizeText(row.textContent).includes(VIEWER_BROADCAST_MARKER)) rows.add(row);
+    });
+    rows.forEach((row) => {
+      row.dataset.rollcodexHiddenViewerBridge = 'true';
+      row.setAttribute('aria-hidden', 'true');
+      row.style.display = 'none';
+    });
+  }
+
+  function scanViewerBroadcasts(root = document.body) {
+    const text = String(root?.textContent || '');
+    if (!text.includes(VIEWER_BROADCAST_MARKER)) return;
+    const pattern = new RegExp(`${VIEWER_BROADCAST_MARKER}([^\\s<]+)`, 'g');
+    let match = pattern.exec(text);
+    while (match) {
+      const token = match[1];
+      if (!processedViewerBroadcasts.has(token)) {
+        const payload = decodeViewerBroadcast(token);
+        const shouldApplyBroadcast = payload?.type === VIEWER_BROADCAST_TYPE && currentRuntimeMode === 'viewer';
+        const shouldHandleRequest = payload?.type === VIEWER_REQUEST_TYPE && currentRuntimeMode === 'gm';
+        if (shouldApplyBroadcast || shouldHandleRequest) {
+          processedViewerBroadcasts.add(token);
+          if (shouldApplyBroadcast) applyViewerBroadcast(payload, { allowWeakChatRelay: true });
+          else handleViewerRequest(payload);
+        }
+      }
+      match = pattern.exec(text);
+    }
+    hideViewerBridgeChatRows(root);
+  }
+
+  function startViewerBroadcastObserver() {
+    if (!isRoll20TablePage()) return;
+    if (viewerBroadcastObserver) return;
+    scanViewerBroadcasts();
+    viewerBroadcastObserver = new MutationObserver((mutations) => {
+      mutations.forEach((mutation) => {
+        mutation.addedNodes.forEach((node) => scanViewerBroadcasts(node));
+      });
+    });
+    viewerBroadcastObserver.observe(document.body, { childList: true, subtree: true });
+  }
+
+  function startViewerChatObserver() {
+    if (!isRoll20TablePage()) return;
+    if (viewerChatObserver) return;
+    const root = document.querySelector('#textchat');
+    if (!root) {
+      window.setTimeout(startViewerChatObserver, 1500);
+      return;
+    }
+    viewerChatObserver = new MutationObserver((mutations) => {
+      const hasChatChange = mutations.some((mutation) => {
+        if (mutation.target?.closest?.(`#${PANEL_ID}`)) return false;
+        return Array.from(mutation.addedNodes || []).some((node) => {
+          if (node.id === PANEL_ID || node.closest?.(`#${PANEL_ID}`)) return false;
+          return normalizeText(node.textContent).length >= 2;
+        });
+      });
+      if (!hasChatChange) return;
+      refreshViewerPanel();
+    });
+    viewerChatObserver.observe(root, { childList: true, subtree: true });
+  }
+
+  async function loadCachedViewerBroadcast() {
+    const stored = await getStorageValue(VIEWER_BROADCAST_CACHE_KEY);
+    if (!stored?.payload) return;
+    if (!viewerBroadcastMatchesCurrentTable(stored.payload)) return;
+    const emittedAt = Date.parse(stored.payload?.emitted_at || stored.cached_at || '');
+    const stamp = Number.isFinite(emittedAt) ? emittedAt : Date.parse(stored.cached_at || '') || Date.now();
+    if (stamp > viewerState.lastSeenAt) {
+      viewerState.broadcast = stored.payload;
+      viewerState.lastSeenAt = stamp;
+    }
   }
 
   getExtensionApi()?.runtime?.onMessage?.addListener((message, _sender, sendResponse) => {
+    if (!isRoll20TablePage()) {
+      cleanupNonTablePage();
+      return false;
+    }
     if (message?.type === MESSAGE_EXTENSION_CONNECTED) {
+      if (currentRuntimeMode === 'viewer') {
+        // Le mode lecteur ne stocke pas de connexion locale : tout vient du broadcast MJ.
+        sendResponse({ ok: false, ignored: true, reason: 'viewer_mode' });
+        return true;
+      }
+      if (message.connection && !connectionMatchesCurrentTable(message.connection)) {
+        sendResponse({ ok: false, ignored: true });
+        return true;
+      }
       refreshPanel('Connexion RollCodex active');
       if (message.connection) {
-        getMappingProfile(message.connection, { force: true })
-          .then(() => refreshPanel('Profil RollCodex recharge'))
+        const scopedConnection = enrichConnectionWithCurrentTableScope(message.connection);
+        const connectionStorageKey = getConnectionStorageKeyForConnection(scopedConnection);
+        if (connectionStorageKey) {
+          setStorageValues({ [connectionStorageKey]: scopedConnection }).catch(() => null);
+        }
+        getMappingProfile(scopedConnection, { force: true })
+          .then((profile) => {
+            broadcastViewerSession(scopedConnection, profile, 'extension_connected');
+            scheduleViewerHeartbeat();
+            refreshPanel('Profil RollCodex recharge');
+          })
           .catch(() => null);
       }
       sendResponse({ ok: true });
@@ -2275,10 +3352,94 @@
     return true;
   });
 
-  startBridgeSnapshotObserver();
-  startAutoCaptureObserver();
-  document.addEventListener('visibilitychange', sendVisibilitySnapshot);
-  window.addEventListener('pagehide', sendPagehideSnapshot);
-  window.addEventListener('beforeunload', sendBeforeUnloadSnapshot);
-  window.setTimeout(() => refreshPanel(), 800);
+  if (!isRoll20TablePage()) {
+    cleanupNonTablePage();
+    return;
+  }
+
+  function reevaluateRuntimeMode(reason = 'recheck') {
+    const detected = getCurrentRoll20ModeInfo();
+    const detectedMode = detected.mode;
+    if (detectedMode === 'viewer' && detected.confidence === 'strong') viewerModeLocked = true;
+    if (currentRuntimeMode === 'viewer' && viewerModeLocked && detectedMode === 'gm' && detected.confidence !== 'strong') {
+      refreshViewerPanel();
+      return false;
+    }
+    if (detectedMode === currentRuntimeMode) return false;
+    currentRuntimeMode = detectedMode;
+    if (detectedMode === 'viewer') {
+      // Le DOM a finalement marque ce navigateur comme joueur : on bascule en lecteur,
+      // on nettoie tout artefact MJ et on demarre les observateurs lecteur.
+      clearAutoCaptureTimer();
+      stopGmLifecycleListeners();
+      stopAutoCaptureObserver();
+      stopBridgeSnapshotObserver();
+      if (viewerHeartbeatTimer) {
+        window.clearInterval(viewerHeartbeatTimer);
+        viewerHeartbeatTimer = null;
+      }
+      startViewerBroadcastObserver();
+      startViewerChatObserver();
+      loadCachedViewerBroadcast().then(() => {
+        refreshViewerPanel(`Mode lecteur (${reason})`);
+        scheduleViewerBroadcastRequests();
+      });
+    } else {
+      // Bascule lecteur -> MJ (rare : reconnexion du MJ apres incertitude DOM).
+      clearViewerRequestTimer();
+      startViewerBroadcastObserver();
+      startBridgeSnapshotObserver();
+      startAutoCaptureObserver();
+      startGmLifecycleListeners();
+      refreshPanel('Mode MJ detecte');
+    }
+    return true;
+  }
+
+  function scheduleRuntimeModeRetries(reason = 'startup') {
+    // Le DOM Roll20 se peuple progressivement (chat, players panel, speakingas).
+    // Sans message chat MJ encore visible, le fallback retourne 'gm'. On retente
+    // a intervalles croissants pour basculer en 'viewer' des qu'un signal arrive.
+    [2000, 5000, 10000, 20000, 45000].forEach((delay) => {
+      window.setTimeout(() => {
+        if (!isRoll20TablePage()) return;
+        reevaluateRuntimeMode(`${reason}+${delay}ms`);
+      }, delay);
+    });
+  }
+
+  const initialRuntimeMode = getCurrentRoll20ModeInfo();
+  currentRuntimeMode = initialRuntimeMode.mode;
+  viewerModeLocked = initialRuntimeMode.mode === 'viewer' && initialRuntimeMode.confidence === 'strong';
+
+  document.addEventListener('visibilitychange', handleVisibilityModeRecheck);
+  window.addEventListener('focus', handleVisibilityModeRecheck);
+
+  if (currentRuntimeMode === 'viewer') {
+    startViewerBroadcastObserver();
+    startViewerChatObserver();
+    window.setTimeout(async () => {
+      if (reevaluateRuntimeMode('post-idle')) return;
+      await loadCachedViewerBroadcast();
+      refreshViewerPanel();
+      scheduleViewerBroadcastRequests();
+    }, 800);
+    scheduleRuntimeModeRetries('post-startup');
+  } else {
+    startViewerBroadcastObserver();
+    startBridgeSnapshotObserver();
+    startAutoCaptureObserver();
+    startGmLifecycleListeners();
+    window.setTimeout(async () => {
+      if (reevaluateRuntimeMode('post-idle')) return;
+      await refreshPanel();
+      const connection = await getCurrentConnection();
+      if (connection) {
+        const profile = await getMappingProfile(connection).catch(() => null);
+        broadcastViewerSession(connection, profile, 'gm_startup');
+        scheduleViewerHeartbeat();
+      }
+    }, 800);
+    scheduleRuntimeModeRetries('post-startup');
+  }
 })();

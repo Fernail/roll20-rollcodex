@@ -40,7 +40,7 @@ Ne gardez pas deux variantes chargees dans le meme navigateur en meme temps.
 
 - Navigateurs cibles : Chrome, Edge, Brave, Opera, Firefox et Safari desktop.
 - Roll20 : table ouverte dans `https://app.roll20.net/`.
-- Extension RollCodex Roll20 : 0.3.3.
+- Extension RollCodex Roll20 : 0.4.0.
 
 Firefox et Safari demandent un paquet dedie : leurs manifests et leurs scripts de fond ne sont pas strictement identiques a Chromium. Le code runtime evite les appels Chrome-only en utilisant `chrome` ou `browser` selon l'interface exposee.
 
@@ -65,6 +65,18 @@ L'extension envoie des captures VTT a relire. RollCodex ne transforme pas automa
 - Auto-capture locale apres activite chat, avec intervalle de securite pour eviter les envois trop rapproches.
 - Panneau live local avec kikimeter base sur les mesures du registre RollCodex cible.
 - Indices de mapping Roll20 joints aux captures : speakers detectes, mappings RollCodex deja confirmes, types d'action approximatifs, limites du DOM Roll20.
+- Panneau lecteur pour les joueurs : si le MJ a connecte la table, chaque joueur ayant l'extension voit un panneau en lecture seule (statut, contexte, kikimeter avec selecteur local). Aucune donnee n'est envoyee depuis le navigateur des joueurs.
+
+## Panneau lecteur (joueurs)
+
+Pour que les joueurs voient le panneau RollCodex sur leur table Roll20 :
+
+1. Le MJ installe l'extension et connecte la table (jumelage RollCodex).
+2. Chaque joueur installe la meme extension Chrome Web Store dans son navigateur.
+3. A l'ouverture de la table, l'extension detecte automatiquement que le joueur n'est pas le MJ et bascule en mode lecteur : seul le bandeau statut, le contexte de la table et le kikimeter (avec selecteur de mesure local) sont affiches. Les boutons Lier, Envoyer, Auto et Fin sont masques.
+4. Le panneau lecteur demande la session au MJ via un whisper Roll20 technique, puis se met a jour quand le MJ envoie une capture ou via un heartbeat regulier (5 min). Aucune capture chat n'est envoyee depuis le navigateur du joueur.
+
+Limite : un joueur sans l'extension ne voit aucun panneau (limitation Chrome : une extension ne peut pas s'injecter dans un navigateur ou elle n'est pas installee).
 
 ## Limites actuelles
 

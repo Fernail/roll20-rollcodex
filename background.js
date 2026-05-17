@@ -6,7 +6,7 @@
   const MESSAGE_SYNC_CONNECTION = 'ROLLCODEX_ROLL20_SYNC_CONNECTION';
   const MESSAGE_OPEN_CONNECT_PAGE = 'ROLLCODEX_ROLL20_OPEN_CONNECT_PAGE';
   const CONFIRM_PREFIX = '!rollcodex confirm ';
-  const BRIDGE_CLIENT = 'roll20-extension/0.3.3';
+  const BRIDGE_CLIENT = 'roll20-extension/0.4.0';
   const PENDING_PAIRING_KEY = 'rollcodexExtensionPendingPairing';
   const CONNECTION_KEY = 'rollcodexExtensionConnection';
 
@@ -98,6 +98,17 @@
     });
   }
 
+  function getAllStorageValues() {
+    return new Promise((resolve) => {
+      const storage = getExtensionApi()?.storage?.local;
+      if (!storage?.get) {
+        resolve({});
+        return;
+      }
+      callExtensionMethod(storage.get.bind(storage), [null], (result) => resolve(result || {}), () => resolve({}));
+    });
+  }
+
   function setStorageValues(values) {
     return new Promise((resolve, reject) => {
       const storage = getExtensionApi()?.storage?.local;
@@ -117,6 +128,73 @@
         return;
       }
       callExtensionMethod(storage.remove.bind(storage), [key], () => resolve(true), reject);
+    });
+  }
+
+  function normalizeScopePart(value) {
+    return String(value || '')
+      .trim()
+      .toLowerCase()
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .replace(/[^a-z0-9]+/g, '_')
+      .replace(/^_+|_+$/g, '')
+      .slice(0, 80);
+  }
+
+  function getConnectionScope(payload = {}) {
+    const gameId = String(payload.roll20_game_id || payload.roll20GameId || '').trim().replace(/[^a-zA-Z0-9_-]+/g, '_').replace(/^_+|_+$/g, '');
+    if (gameId) return `game:${gameId}`;
+    const titleKey = normalizeScopePart(payload.roll20_game_title || payload.roll20GameTitle);
+    return titleKey && titleKey !== 'roll20' ? `title:${titleKey}` : '';
+  }
+
+  function getConnectionStorageKey(connection = {}) {
+    const scope = connection.roll20_scope_key || connection.roll20ScopeKey || getConnectionScope(connection);
+    return scope ? `${CONNECTION_KEY}:${scope}` : CONNECTION_KEY;
+  }
+
+  function enrichConnectionScope(connection, scopeSource = {}) {
+    if (!connection) return connection;
+    const roll20GameId = connection.roll20_game_id || scopeSource.roll20GameId || scopeSource.roll20_game_id || '';
+    const roll20GameTitle = connection.roll20_game_title || scopeSource.roll20GameTitle || scopeSource.roll20_game_title || '';
+    const roll20ScopeKey = connection.roll20_scope_key || scopeSource.roll20ScopeKey || scopeSource.roll20_scope_key || getConnectionScope({
+      roll20_game_id: roll20GameId,
+      roll20_game_title: roll20GameTitle,
+    });
+    return {
+      ...connection,
+      roll20_game_id: roll20GameId,
+      roll20_game_title: roll20GameTitle,
+      roll20_scope_key: roll20ScopeKey,
+    };
+  }
+
+  function getStoredRoll20Connections() {
+    return getAllStorageValues().then((values) => Object.entries(values || {})
+      .filter(([key, value]) => (key === CONNECTION_KEY || key.startsWith(`${CONNECTION_KEY}:`)) && isValidStoredRoll20Connection(value))
+      .map(([key, value]) => ({ key, connection: value })));
+  }
+
+  function isValidPendingPairing(pending) {
+    return typeof pending?.connectionId === 'string'
+      && typeof pending?.state === 'string'
+      && typeof pending?.connectionSecret === 'string';
+  }
+
+  function getStoredPendingPairings() {
+    return getAllStorageValues().then((values) => Object.entries(values || {})
+      .filter(([key, value]) => (key === PENDING_PAIRING_KEY || key.startsWith(`${PENDING_PAIRING_KEY}:`)) && isValidPendingPairing(value))
+      .map(([key, pending]) => ({ key, pending })));
+  }
+
+  function removePendingPairingsByConnectionId(connectionId) {
+    const expected = String(connectionId || '').trim();
+    if (!expected) return Promise.resolve(true);
+    return getStoredPendingPairings().then((entries) => {
+      const targets = (entries || []).filter(({ pending }) => String(pending?.connectionId || '').trim() === expected);
+      if (!targets.length) return true;
+      return Promise.all(targets.map(({ key }) => removeStorageValue(key).catch(() => false))).then(() => true);
     });
   }
 
@@ -174,7 +252,7 @@
     if (!pendingPairing.connectionSecret) return null;
     const mappingProfileEndpoint = String(payload.mappingProfileEndpoint || payload.mapping_profile_endpoint || '').trim();
     if (mappingProfileEndpoint && !isAllowedMappingProfileEndpoint(mappingProfileEndpoint)) return null;
-    return {
+    return enrichConnectionScope({
       provider: 'roll20',
       source_format: 'roll20_mod_json',
       connection_id: payload.connectionId,
@@ -190,7 +268,7 @@
       table_id: payload.tableId || payload.table_id || '',
       table_label: payload.tableLabel || payload.table_label || '',
       connected_at: new Date().toISOString(),
-    };
+    }, pendingPairing);
   }
 
   function buildSyncedExtensionConnection(payload) {
@@ -201,7 +279,7 @@
     if (payload?.provider !== 'roll20' || !connectionId || !connectionSecret || !isAllowedSnapshotEndpoint(endpoint)) return null;
     if (mappingProfileEndpoint && !isAllowedMappingProfileEndpoint(mappingProfileEndpoint)) return null;
 
-    return {
+    return enrichConnectionScope({
       provider: 'roll20',
       source_format: 'roll20_mod_json',
       connection_id: connectionId,
@@ -218,7 +296,7 @@
       table_label: payload.tableLabel || payload.table_label || '',
       connected_at: new Date().toISOString(),
       synced_from_rollcodex_at: new Date().toISOString(),
-    };
+    }, payload);
   }
 
   function buildSyncedConnectionContext(payload) {
@@ -229,7 +307,7 @@
     if (endpoint && !isAllowedSnapshotEndpoint(endpoint)) return null;
     if (mappingProfileEndpoint && !isAllowedMappingProfileEndpoint(mappingProfileEndpoint)) return null;
 
-    return {
+    return enrichConnectionScope({
       provider: 'roll20',
       source_format: 'roll20_mod_json',
       connection_id: connectionId,
@@ -244,7 +322,7 @@
       table_id: payload.tableId || payload.table_id || '',
       table_label: payload.tableLabel || payload.table_label || '',
       synced_from_rollcodex_at: new Date().toISOString(),
-    };
+    }, payload);
   }
 
   function mergeSyncedConnectionContext(existingConnection, contextPatch) {
@@ -263,20 +341,25 @@
       campaign_label: contextPatch.campaign_label || existingConnection.campaign_label || '',
       table_id: contextPatch.table_id || existingConnection.table_id || '',
       table_label: contextPatch.table_label || existingConnection.table_label || '',
+      roll20_game_id: contextPatch.roll20_game_id || existingConnection.roll20_game_id || '',
+      roll20_game_title: contextPatch.roll20_game_title || existingConnection.roll20_game_title || '',
+      roll20_scope_key: contextPatch.roll20_scope_key || existingConnection.roll20_scope_key || '',
       synced_from_rollcodex_at: contextPatch.synced_from_rollcodex_at,
     };
   }
 
   function notifyRoll20Tab(extensionConnection) {
-    return queryTabs({ url: 'https://app.roll20.net/*' }).then((tabs) => {
-      const targetTab = pickRoll20Tab(tabs || []);
-      if (!targetTab?.id) return false;
-      return sendTabMessage(targetTab.id, { type: MESSAGE_EXTENSION_CONNECTED, connection: extensionConnection });
+    return queryTabs({ url: 'https://app.roll20.net/editor*' }).then((tabs) => {
+      const jobs = (tabs || [])
+        .filter((tab) => tab?.id)
+        .map((tab) => sendTabMessage(tab.id, { type: MESSAGE_EXTENSION_CONNECTED, connection: extensionConnection }));
+      if (!jobs.length) return false;
+      return Promise.all(jobs).then((results) => results.some(Boolean));
     });
   }
 
   function ensureRoll20ContentScriptInjected() {
-    return queryTabs({ url: 'https://app.roll20.net/*' }).then((tabs) => {
+    return queryTabs({ url: 'https://app.roll20.net/editor*' }).then((tabs) => {
       const jobs = (tabs || []).map((tab) => {
         if (!tab?.id) return Promise.resolve(false);
         return sendTabMessage(tab.id, { type: MESSAGE_EXTENSION_CONNECTED, connection: null })
@@ -295,10 +378,11 @@
 
   function rehydrateRoll20ConnectionFromStorage() {
     return ensureRoll20ContentScriptInjected()
-      .then(() => getStorageValue(CONNECTION_KEY))
-      .then((connection) => {
-        if (!isValidStoredRoll20Connection(connection)) return false;
-        return notifyRoll20Tab(connection).catch(() => false);
+      .then(() => getStoredRoll20Connections())
+      .then((connections) => {
+        if (!connections.length) return false;
+        return Promise.all(connections.map(({ connection }) => notifyRoll20Tab(connection).catch(() => false)))
+          .then((results) => results.some(Boolean));
       })
       .catch(() => false);
   }
@@ -385,18 +469,15 @@
 
     const payload = parseConfirmationCommand(command);
 
-    getStorageValue(PENDING_PAIRING_KEY).then((pendingPairing) => {
+    getStoredPendingPairings().then((pendingEntries) => {
+      const pendingEntry = (pendingEntries || []).find(({ pending }) => pending?.connectionId === payload?.connectionId && pending?.state === payload?.state) || null;
+      const pendingPairing = pendingEntry?.pending || null;
       const extensionConnection = buildExtensionConnection(payload, pendingPairing);
       if (extensionConnection) {
-        setStorageValues({ [CONNECTION_KEY]: extensionConnection }).then(() => removeStorageValue(PENDING_PAIRING_KEY)).then(() => {
-          queryTabs({ url: 'https://app.roll20.net/*' }).then((tabs) => {
-            const targetTab = pickRoll20Tab(tabs || []);
-            const notifyPromise = targetTab?.id
-              ? sendTabMessage(targetTab.id, { type: MESSAGE_EXTENSION_CONNECTED, connection: extensionConnection })
-              : Promise.resolve(false);
-            notifyPromise.then((notifiedRoll20Tab) => sendResponse({ ok: true, mode: 'extension', notifiedRoll20Tab, connection: extensionConnection }));
-          });
-        });
+        setStorageValues({ [getConnectionStorageKey(extensionConnection)]: extensionConnection })
+          .then(() => (pendingEntry?.key ? removeStorageValue(pendingEntry.key) : true))
+          .then(() => notifyRoll20Tab(extensionConnection))
+          .then((notifiedRoll20Tab) => sendResponse({ ok: true, mode: 'extension', notifiedRoll20Tab, connection: extensionConnection }));
         return;
       }
 
@@ -413,14 +494,20 @@
         return;
       }
 
-      getStorageValue(CONNECTION_KEY)
-        .then((existingConnection) => {
-          const mergedConnection = mergeSyncedConnectionContext(existingConnection, contextPatch);
+      getStoredRoll20Connections()
+        .then((storedConnections) => {
+          const contextScope = contextPatch.roll20_scope_key || getConnectionScope(contextPatch);
+          const stored = storedConnections.find(({ connection }) => {
+            if (connection.connection_id !== contextPatch.connection_id) return false;
+            if (!contextScope) return true;
+            return (connection.roll20_scope_key || getConnectionScope(connection)) === contextScope;
+          }) || storedConnections.find(({ connection }) => connection.connection_id === contextPatch.connection_id);
+          const mergedConnection = mergeSyncedConnectionContext(stored?.connection, contextPatch);
           if (!mergedConnection) {
             sendResponse({ ok: false, error: 'Connexion Roll20 existante introuvable pour ce contexte.' });
             return null;
           }
-          return setStorageValues({ [CONNECTION_KEY]: mergedConnection })
+          return setStorageValues({ [stored?.key || getConnectionStorageKey(mergedConnection)]: mergedConnection })
             .then(() => notifyRoll20Tab(mergedConnection))
             .then((notifiedRoll20Tab) => sendResponse({ ok: true, mode: 'context', notifiedRoll20Tab, connection: mergedConnection }));
         })
@@ -428,8 +515,8 @@
       return;
     }
 
-    setStorageValues({ [CONNECTION_KEY]: extensionConnection })
-      .then(() => removeStorageValue(PENDING_PAIRING_KEY))
+    setStorageValues({ [getConnectionStorageKey(extensionConnection)]: extensionConnection })
+      .then(() => removePendingPairingsByConnectionId(extensionConnection.connection_id))
       .then(() => notifyRoll20Tab(extensionConnection))
       .then((notifiedRoll20Tab) => sendResponse({ ok: true, notifiedRoll20Tab, connection: extensionConnection }))
       .catch((error) => sendResponse({ ok: false, error: error?.message || 'Synchronisation Roll20 impossible.' }));
