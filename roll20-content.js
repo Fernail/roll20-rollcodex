@@ -455,6 +455,11 @@
 
   function extractRollFigures(rawText) {
     const text = normalizeText(rawText);
+    const rollMode = /\b(?:disadvantage|disadv|desavantage|désavantage)\b/i.test(text)
+      ? 'disadvantage'
+      : /\b(?:advantage|adv|avantage)\b/i.test(text)
+        ? 'advantage'
+        : '';
     const rollNatural = inferRollNatural(text);
     const totalMatch = text.match(/\b(?:total|result|resultat)\D{0,12}(\d{1,3})\b/i);
     const attackCardTotal = inferRoll20AttackCardTotal(text);
@@ -473,11 +478,20 @@
     const explicitRollTotal = toSafeNumber(totalMatch?.[1]);
     const hasRoll = /\b(?:d20|1d20|jet|roll|resultat|total)\b/i.test(text) || rollNatural != null || explicitRollTotal != null || attackCardTotal != null;
     const actionType = inferLiveActionType(text, { damageTotal, healTotal, hasRoll, attackCardTotal });
-    const rollTotal = explicitRollTotal ?? attackCardTotal ?? inferStandaloneRollTotal(text, actionType);
+    let rollTotal = explicitRollTotal ?? attackCardTotal ?? inferStandaloneRollTotal(text, actionType);
+    if (rollMode && explicitRollTotal == null && attackCardTotal == null && damageTotal == null && healTotal == null) {
+      const numbers = Array.from(text.matchAll(/\b(\d{1,3})\b/g))
+        .map((match) => toSafeNumber(match[1]))
+        .filter((value) => value != null && value >= 1 && value <= 40);
+      if (numbers.length >= 2) {
+        rollTotal = rollMode === 'advantage' ? Math.max(...numbers.slice(0, 2)) : Math.min(...numbers.slice(0, 2));
+      }
+    }
     return {
       actionType,
       rollNatural,
       rollTotal,
+      rollMode,
       damageTotal,
       healTotal,
       actionName: inferActionNameHint(text, actionType),
@@ -2423,10 +2437,13 @@
       skill_name_hint: figures.skillName,
       roll_total_hint: rollTotal,
       roll_natural_hint: rollNatural,
+      roll_mode_hint: figures.rollMode,
       damage_total_hint: damageTotal,
       heal_total_hint: healTotal,
       is_critical_hint: figures.isCritical === true,
       is_fumble_hint: figures.isFumble === true,
+      is_advantage_hint: figures.rollMode === 'advantage',
+      is_disadvantage_hint: figures.rollMode === 'disadvantage',
     };
     if (speaker && speaker !== 'Roll20' && (hadExplicitSpeaker || lastResolvedChatSpeaker)) {
       lastResolvedChatSpeaker = speaker;
