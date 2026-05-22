@@ -1607,14 +1607,14 @@
       // On accepte les cartes "Crit Damage" (degats uniquement, sans d20) comme preuves de critique.
       if (!isRollLikeMessage(message) && !hasCritFlag) return false;
       bucket.denominator += 1;
-      if (message.roll_natural_hint === 20 || hasCritFlag) bucket.numerator += 1;
+      if (hasCritFlag) bucket.numerator += 1;
       return true;
     }
     if (aggregation === 'percent_fumble') {
       const hasFumbleFlag = message.is_fumble_hint === true;
       if (!isRollLikeMessage(message) && !hasFumbleFlag) return false;
       bucket.denominator += 1;
-      if (message.roll_natural_hint === 1 || hasFumbleFlag) bucket.numerator += 1;
+      if (hasFumbleFlag) bucket.numerator += 1;
       return true;
     }
     if (aggregation === 'percent') {
