@@ -453,18 +453,138 @@
     return match ? normalizeText(match[1]) : '';
   }
 
-  function extractRollFigures(rawText) {
+  function inferStackedRoll20AttackDamage(rawText) {
+    const damageTypes = /^(?:acid|bludgeoning|cold|fire|force|lightning|necrotic|piercing|poison|psychic|radiant|slashing|thunder|acide|contondant|froid|feu|foudre|necrotique|nécrotique|perforant|psychique|tranchant|tonnerre)$/i;
+    const lines = String(rawText || '')
+      .split(/\r?\n/)
+      .map((line) => normalizeText(line))
+      .filter(Boolean);
+    if (lines.length < 4) return null;
+    const actionIndex = lines.findIndex((line, index) => (
+      index > 0
+      && /[a-zÀ-ÿ]/i.test(line)
+      && /\([+-]\s*\d+\)/.test(line)
+    ));
+    if (actionIndex < 1) return null;
+    const damageTypeIndex = lines.findIndex((line, index) => index > actionIndex && damageTypes.test(line));
+    if (damageTypeIndex < 0) return null;
+    const damageValues = lines
+      .slice(actionIndex + 1, damageTypeIndex)
+      .map((line) => (/^\d+$/.test(line) ? Number(line) : null))
+      .filter((value) => Number.isFinite(value));
+    if (!damageValues.length) return null;
+    return {
+      actionName: lines[actionIndex].replace(/\s*\([+-]\s*\d+\)\s*$/g, ''),
+      damageTotal: damageValues.reduce((sum, value) => sum + value, 0),
+    };
+  }
+
+  function parseVisualRollColor(value) {
+    const text = String(value || '').trim().toLowerCase();
+    if (!text) return null;
+    if (text === 'white') return { red: 255, green: 255, blue: 255 };
+    const rgb = text.match(/rgba?\s*\(\s*(\d{1,3})\s*,\s*(\d{1,3})\s*,\s*(\d{1,3})/i);
+    if (rgb) return { red: Number(rgb[1]), green: Number(rgb[2]), blue: Number(rgb[3]) };
+    const hex = text.match(/#([0-9a-f]{3}|[0-9a-f]{6})\b/i);
+    if (!hex) return null;
+    const valueText = hex[1].length === 3
+      ? hex[1].split('').map((part) => `${part}${part}`).join('')
+      : hex[1];
+    return {
+      red: Number.parseInt(valueText.slice(0, 2), 16),
+      green: Number.parseInt(valueText.slice(2, 4), 16),
+      blue: Number.parseInt(valueText.slice(4, 6), 16),
+    };
+  }
+
+  function parseStackedRollElementTotal(element) {
+    const text = normalizeText(element?.textContent || '').replace(/\s+/g, ' ');
+    const match = text.match(/^(\d{1,3})(?:\s*[+-]\s*\d{1,2})?$/);
+    if (!match) return null;
+    const total = toSafeNumber(match[1]);
+    return total != null && total >= 1 && total <= 60 ? total : null;
+  }
+
+  function getVisualRollTone(element) {
+    if (!element) return null;
+    const className = String(element.className || '').toLowerCase();
+    if (/\b(?:discarded?|ignored?|inactive|muted|dim|grey|gray|secondary)\b/.test(className)) return 'muted';
+    if (/\b(?:selected|retained|kept|active|white|foreground)\b/.test(className)) return 'selected';
+    const style = typeof window !== 'undefined' && window.getComputedStyle ? window.getComputedStyle(element) : null;
+    const opacity = Number(style?.opacity);
+    if (Number.isFinite(opacity) && opacity > 0 && opacity <= 0.75) return 'muted';
+    const color = parseVisualRollColor(style?.color || element.getAttribute?.('color') || '');
+    if (!color) return null;
+    const max = Math.max(color.red, color.green, color.blue);
+    const min = Math.min(color.red, color.green, color.blue);
+    const average = (color.red + color.green + color.blue) / 3;
+    if (max - min > 45) return null;
+    if (average >= 215) return 'selected';
+    if (average <= 190) return 'muted';
+    return null;
+  }
+
+  function inferVisualRollSelection(node) {
+    if (!node || typeof node.querySelectorAll !== 'function') return null;
+    const selectors = '.inlinerollresult, [class*="roll"], [class*="Roll"], [class*="ROLL"], [class*="adv"], [class*="Adv"], [class*="disadv"], [class*="Disadv"]';
+    const candidates = [];
+    if (typeof node.matches === 'function' && node.matches(selectors)) candidates.push(node);
+    candidates.push(...Array.from(node.querySelectorAll(selectors)));
+
+    const entries = candidates
+      .map((element) => ({ element, total: parseStackedRollElementTotal(element), tone: getVisualRollTone(element) }))
+      .filter((entry) => entry.total != null)
+      .filter((entry, index, all) => !all.some((other, otherIndex) => (
+        otherIndex !== index
+        && other.element !== entry.element
+        && entry.element.contains(other.element)
+        && other.total === entry.total
+      )))
+      .slice(0, 2);
+    if (entries.length < 2) return null;
+
+    const selectedIndexes = entries
+      .map((entry, index) => (entry.tone === 'selected' ? index : null))
+      .filter((index) => index != null);
+    let selectedIndex = selectedIndexes.length === 1 ? selectedIndexes[0] : null;
+    if (selectedIndex == null) {
+      const mutedIndexes = entries
+        .map((entry, index) => (entry.tone === 'muted' ? index : null))
+        .filter((index) => index != null);
+      if (mutedIndexes.length === 1) selectedIndex = mutedIndexes[0] === 0 ? 1 : 0;
+    }
+    if (selectedIndex == null) return null;
+
+    const selectedTotal = entries[selectedIndex].total;
+    const discardedTotal = entries.find((_, index) => index !== selectedIndex)?.total;
+    const rollMode = selectedTotal > discardedTotal
+      ? 'advantage'
+      : selectedTotal < discardedTotal
+        ? 'disadvantage'
+        : '';
+    return {
+      selectedTotal,
+      selectedIndex,
+      rollMode,
+      rollTotals: entries.map((entry) => entry.total),
+    };
+  }
+
+  function extractRollFigures(rawText, node = null) {
     const text = normalizeText(rawText);
+    const visualRoll = inferVisualRollSelection(node);
     const rollMode = /\b(?:disadvantage|disadv|desavantage|désavantage)\b/i.test(text)
       ? 'disadvantage'
       : /\b(?:advantage|adv|avantage)\b/i.test(text)
         ? 'advantage'
-        : '';
+        : visualRoll?.rollMode || '';
     const rollNatural = inferRollNatural(text);
     const totalMatch = text.match(/\b(?:total|result|resultat)\D{0,12}(\d{1,3})\b/i);
     const attackCardTotal = inferRoll20AttackCardTotal(text);
+    const stackedAttackDamage = inferStackedRoll20AttackDamage(rawText);
     const damageTotal = attackCardTotal == null
-      ? inferAmountAfterKeyword(text, /\b(?:critical\s+damage|crit\s+damage|damage|dmg|degats)(?![a-z])/gi)
+      ? stackedAttackDamage?.damageTotal
+        ?? inferAmountAfterKeyword(text, /\b(?:critical\s+damage|crit\s+damage|damage|dmg|degats)(?![a-z])/gi)
         ?? inferAmountFromText(text, [
           /\b(?:damage|dmg|degats)\D{0,24}(\d{1,4})\b/i,
           /\b(\d{1,4})\s*(?:damage|dmg|degats)\b/i,
@@ -476,9 +596,10 @@
         /\b(\d{1,4})\s*(?:heal|healing|soin|soins)\b/i,
       ]);
     const explicitRollTotal = toSafeNumber(totalMatch?.[1]);
-    const hasRoll = /\b(?:d20|1d20|jet|roll|resultat|total)\b/i.test(text) || rollNatural != null || explicitRollTotal != null || attackCardTotal != null;
-    const actionType = inferLiveActionType(text, { damageTotal, healTotal, hasRoll, attackCardTotal });
-    let rollTotal = explicitRollTotal ?? attackCardTotal ?? inferStandaloneRollTotal(text, actionType);
+    const hasRoll = /\b(?:d20|1d20|jet|roll|resultat|total)\b/i.test(text) || rollNatural != null || explicitRollTotal != null || attackCardTotal != null || visualRoll?.selectedTotal != null;
+    const attackCueTotal = attackCardTotal ?? (stackedAttackDamage && visualRoll?.selectedTotal != null ? visualRoll.selectedTotal : null);
+    const actionType = inferLiveActionType(text, { damageTotal, healTotal, hasRoll, attackCardTotal: attackCueTotal });
+    let rollTotal = visualRoll?.selectedTotal ?? explicitRollTotal ?? attackCardTotal ?? inferStandaloneRollTotal(text, actionType);
     if (rollMode && explicitRollTotal == null && attackCardTotal == null && damageTotal == null && healTotal == null) {
       const numbers = Array.from(text.matchAll(/\b(\d{1,3})\b/g))
         .map((match) => toSafeNumber(match[1]))
@@ -492,9 +613,11 @@
       rollNatural,
       rollTotal,
       rollMode,
+      rollTotals: visualRoll?.rollTotals || [],
+      selectedRollIndex: visualRoll?.selectedIndex ?? null,
       damageTotal,
       healTotal,
-      actionName: inferActionNameHint(text, actionType),
+      actionName: stackedAttackDamage?.actionName || inferActionNameHint(text, actionType),
       subType: inferSubTypeHint(text, actionType),
       skillName: inferSkillNameHint(text, actionType),
       isCritical: rollNatural === 20 || /\b(?:critical|critique|crit\s+(?:damage|dmg|degats|hit|touche))\b/i.test(text),
@@ -2378,7 +2501,7 @@
     const gmName = getCurrentGmName();
     const rollCardSpeaker = getRollCardSpeaker(node, rawText);
     const hadExplicitSpeaker = Boolean(sender || rollCardSpeaker || getSpeakerFromText(rawText));
-    const figures = extractRollFigures(rawText);
+    const figures = extractRollFigures(rawText, node);
     const isFollowUpAmount = (figures.damageTotal != null || figures.healTotal != null)
       && figures.rollTotal == null
       && figures.rollNatural == null;
