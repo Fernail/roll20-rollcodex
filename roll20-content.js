@@ -505,6 +505,25 @@
     return total != null && total >= 1 && total <= 60 ? total : null;
   }
 
+  function hasRoll20ClassTokenInAncestry(element, root, tokenPattern) {
+    let current = element;
+    while (current) {
+      const classTokens = String(current.className || '').toLowerCase().split(/\s+/).filter(Boolean);
+      if (classTokens.some((token) => tokenPattern.test(token))) return true;
+      if (current === root) break;
+      current = current.parentElement || current.parentNode;
+    }
+    return false;
+  }
+
+  function isRoll20EffectRollElement(element, root) {
+    return hasRoll20ClassTokenInAncestry(
+      element,
+      root,
+      /^(?:sheet-damagetemplate|sheet-rolltemplate-dmg|sheet-damage|damage|dmg|healing|heal)$/,
+    );
+  }
+
   function getVisualRollTone(element) {
     if (!element) return null;
     const className = String(element.className || '').toLowerCase();
@@ -526,7 +545,7 @@
 
   function inferVisualRollSelection(node) {
     if (!node || typeof node.querySelectorAll !== 'function') return null;
-    const selectors = '.inlinerollresult, [class*="roll"], [class*="Roll"], [class*="ROLL"], [class*="adv"], [class*="Adv"], [class*="disadv"], [class*="Disadv"]';
+    const selectors = '.inlinerollresult, [class*="roll"], [class*="Roll"], [class*="ROLL"]';
     const candidates = [];
     if (typeof node.matches === 'function' && node.matches(selectors)) candidates.push(node);
     candidates.push(...Array.from(node.querySelectorAll(selectors)));
@@ -534,6 +553,7 @@
     const entries = candidates
       .map((element) => ({ element, total: parseStackedRollElementTotal(element), tone: getVisualRollTone(element) }))
       .filter((entry) => entry.total != null)
+      .filter((entry) => !isRoll20EffectRollElement(entry.element, node))
       .filter((entry, index, all) => !all.some((other, otherIndex) => (
         otherIndex !== index
         && other.element !== entry.element
