@@ -1481,7 +1481,7 @@
   }
 
   function isRollLikeMessage(message) {
-    const actionType = normalizeText(message?.action_type_hint).toLowerCase();
+    const actionType = normalizeText(message?.event_type_hint || message?.action_type_hint).toLowerCase();
     return message?.roll_total_hint != null
       || message?.roll_natural_hint != null
       || LIVE_ROLL_EVENT_TYPES.has(actionType);
@@ -1489,7 +1489,7 @@
 
   function messageMatchesMetricFilter(message, metric) {
     const filters = metric.filterEventType || [];
-    const actionType = normalizeText(message?.action_type_hint || 'message').toLowerCase();
+    const actionType = normalizeText(message?.event_type_hint || message?.action_type_hint || 'message').toLowerCase();
     const matchesEventType = !filters.length || filters.some((filter) => {
       if (filter === actionType) return true;
       if (LIVE_DAMAGE_EVENT_TYPES.has(filter)) {
@@ -1582,6 +1582,83 @@
         || Number(right.isCharacter) - Number(left.isCharacter)
         || right.labelKey.length - left.labelKey.length);
     return candidates[0]?.mapping || null;
+  }
+
+  function normalizeScopedPatternKey(value) {
+    return normalizeText(value)
+      .toLowerCase()
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .replace(/[^a-z0-9]+/g, ' ')
+      .trim();
+  }
+
+  function getScopedPatternScopeRank(scopeKey) {
+    const key = normalizeText(scopeKey).toLowerCase();
+    if (key.startsWith('character:')) return 0;
+    if (key.startsWith('player:')) return 1;
+    if (key.startsWith('table:')) return 2;
+    if (key.startsWith('campaign:')) return 3;
+    if (key === 'workspace') return 4;
+    return 9;
+  }
+
+  function getMessageScopedScopeKeys(profile, message) {
+    const scopeKeys = new Set(['workspace']);
+    const context = profile?.context && typeof profile.context === 'object' ? profile.context : {};
+    const tableId = normalizeText(context.table_id);
+    const campaignId = normalizeText(context.campaign_id);
+    if (tableId) scopeKeys.add(`table:${tableId}`);
+    if (campaignId) scopeKeys.add(`campaign:${campaignId}`);
+
+    const speaker = normalizeSpeakerLabel(message?.speaker);
+    const mapping = resolveSpeakerMapping(profile, speaker)
+      || (speaker === 'Roll20' ? resolveSpeakerMappingFromText(profile, message?.raw_text) : null);
+    const targetKind = normalizeText(mapping?.target_kind).toLowerCase();
+    const targetId = normalizeText(mapping?.target_id);
+    if (targetId && targetKind === 'character') scopeKeys.add(`character:${targetId}`);
+    if (targetId && targetKind === 'player') scopeKeys.add(`player:${targetId}`);
+    return scopeKeys;
+  }
+
+  function resolveScopedActionEventTypeHint(profile, message) {
+    const scopedPatterns = Array.isArray(profile?.scoped_patterns) ? profile.scoped_patterns : [];
+    if (!scopedPatterns.length) return null;
+
+    const actionKey = normalizeScopedPatternKey(message?.action_name_hint || message?.action_name);
+    const rawKey = normalizeScopedPatternKey(message?.raw_text);
+    if (!actionKey && !rawKey) return null;
+
+    const allowedScopes = getMessageScopedScopeKeys(profile, message);
+    const candidates = scopedPatterns
+      .filter((pattern) => {
+        if (pattern?.pattern_kind !== 'action_event_type') return false;
+        if (pattern?.target_kind !== 'event_type') return false;
+        if (!allowedScopes.has(normalizeText(pattern.scope_key))) return false;
+        const reviewState = normalizeText(pattern.review_state || 'accepted').toLowerCase();
+        if (reviewState && reviewState !== 'accepted' && reviewState !== 'corrected') return false;
+        const patternKey = normalizeScopedPatternKey(pattern.pattern_key || pattern.pattern_label);
+        if (!patternKey) return false;
+        return (actionKey && patternKey === actionKey)
+          || (rawKey && patternKey.length >= 3 && rawKey.includes(patternKey));
+      })
+      .sort((left, right) => {
+        const scopeDelta = getScopedPatternScopeRank(left.scope_key) - getScopedPatternScopeRank(right.scope_key);
+        if (scopeDelta !== 0) return scopeDelta;
+        return Number(right.confidence || 0) - Number(left.confidence || 0);
+      });
+    const selected = candidates[0];
+    const eventType = normalizeText(selected?.target_value);
+    if (!eventType) return null;
+    return {
+      eventType,
+      pattern: {
+        scope_key: selected.scope_key || null,
+        pattern_key: selected.pattern_key || null,
+        target_value: eventType,
+        confidence: Number(selected.confidence || 0),
+      },
+    };
   }
 
   function getMetricBucket(profile, message) {
@@ -2588,6 +2665,11 @@
       is_advantage_hint: figures.rollMode === 'advantage',
       is_disadvantage_hint: figures.rollMode === 'disadvantage',
     };
+    const scopedActionHint = resolveScopedActionEventTypeHint(mappingProfile, msg);
+    if (scopedActionHint) {
+      msg.event_type_hint = scopedActionHint.eventType;
+      msg.scoped_pattern_hint = scopedActionHint.pattern;
+    }
     if (speaker && speaker !== 'Roll20' && (hadExplicitSpeaker || lastResolvedChatSpeaker)) {
       lastResolvedChatSpeaker = speaker;
     }
@@ -2653,7 +2735,8 @@
       const participant = liveMetricsState.participants.get(speaker);
       participant.messages += 1;
       liveMetricsState.totals.messages += 1;
-      if (message.roll_total_hint != null || message.roll_natural_hint != null || message.action_type_hint === 'roll') {
+      const eventType = message.event_type_hint || message.action_type_hint || 'message';
+      if (message.roll_total_hint != null || message.roll_natural_hint != null || eventType === 'roll') {
         participant.rolls += 1;
         liveMetricsState.totals.rolls += 1;
       }
@@ -2673,10 +2756,10 @@
         participant.healing += message.heal_total_hint;
         liveMetricsState.totals.healing += message.heal_total_hint;
       }
-      if (message.action_type_hint !== 'message') {
+      if (eventType !== 'message') {
         liveMetricsState.recentEvents.unshift({
           speaker,
-          action_type: message.action_type_hint,
+          action_type: eventType,
           roll_total: message.roll_total_hint,
           roll_natural: message.roll_natural_hint,
           damage_total: message.damage_total_hint,
