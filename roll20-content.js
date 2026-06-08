@@ -646,6 +646,45 @@
     };
   }
 
+  function buildRollPayloadForSnapshot(figures, { rollTotal = null, rollNatural = null } = {}) {
+    const rollTotals = Array.isArray(figures?.rollTotals)
+      ? figures.rollTotals.filter((value) => Number.isFinite(Number(value))).map(Number)
+      : [];
+    const rollMode = normalizeText(figures?.rollMode);
+    const selectedRollIndex = figures?.selectedRollIndex;
+    const hasSelectedIndex = Number.isInteger(selectedRollIndex) && selectedRollIndex >= 0;
+    const hasRollData = rollTotal != null
+      || rollNatural != null
+      || rollMode
+      || rollTotals.length
+      || hasSelectedIndex;
+    if (!hasRollData) return null;
+
+    return {
+      ...(rollTotal != null ? {
+        selected_total: rollTotal,
+        roll_total: rollTotal,
+      } : {}),
+      ...(rollNatural != null ? {
+        selected_natural: rollNatural,
+        roll_natural: rollNatural,
+      } : {}),
+      ...(rollMode ? { roll_mode: rollMode } : {}),
+      ...(rollTotals.length ? {
+        roll_totals: rollTotals,
+        totals: rollTotals,
+      } : {}),
+      ...(hasSelectedIndex ? { selected_index: selectedRollIndex } : {}),
+      roll20: {
+        source: rollTotals.length > 1 ? 'roll20_extension_visual_pair' : 'roll20_extension_snapshot',
+        ...(rollMode ? { roll_mode: rollMode } : {}),
+        ...(rollTotals.length ? { roll_totals: rollTotals } : {}),
+        ...(hasSelectedIndex ? { selected_index: selectedRollIndex } : {}),
+        ...(rollTotal != null ? { selected_total: rollTotal } : {}),
+      },
+    };
+  }
+
   function getSpeakerFromText(rawText) {
     const text = normalizeText(rawText);
     const match = text.match(/^([^:]{2,48}):\s+(.+)$/);
@@ -2622,28 +2661,42 @@
     if (!speaker || speaker === 'Roll20') {
       speaker = gmName;
     }
+    const scopedActionHint = resolveScopedActionEventTypeHint(mappingProfile, {
+      speaker,
+      raw_text: rawText,
+      action_name_hint: figures.actionName,
+      action_name: figures.actionName,
+    });
     // Séparation stricte attaque/dégâts :
     let actionType = figures.actionType;
+    const eventType = scopedActionHint?.eventType || actionType;
     let rollTotal = figures.rollTotal;
     let rollNatural = figures.rollNatural;
     let damageTotal = figures.damageTotal;
     let healTotal = figures.healTotal;
     // Renforce la séparation : un message ne peut pas être à la fois attaque ET dégâts
-    if (actionType === 'attack' || actionType === 'spell_attack') {
+    if (eventType === 'attack' || eventType === 'spell_attack') {
       damageTotal = null;
       healTotal = null;
       // Si le texte contient aussi un mot-clé "damage" mais c'est une attaque, on ignore le champ dégâts
-    } else if (actionType === 'damage' || actionType === 'spell_damage') {
+    } else if (eventType === 'damage' || eventType === 'spell_damage') {
       rollTotal = null;
       rollNatural = null;
       // Si le texte contient aussi un mot-clé "attack" mais c'est un dégât, on ignore le roll
-    } else {
+    } else if (eventType === 'healing' || eventType === 'heal') {
+      rollTotal = null;
+      rollNatural = null;
+      damageTotal = null;
+    } else if (!LIVE_ROLL_EVENT_TYPES.has(eventType)) {
       // Si le type n'est ni attaque ni dégâts, on neutralise tout
       rollTotal = null;
       rollNatural = null;
       damageTotal = null;
       healTotal = null;
     }
+    const rollPayload = (rollTotal != null || rollNatural != null || LIVE_ROLL_EVENT_TYPES.has(eventType))
+      ? buildRollPayloadForSnapshot(figures, { rollTotal, rollNatural })
+      : null;
     const msg = {
       key,
       timestamp: new Date().toISOString(),
@@ -2652,9 +2705,11 @@
       original_speaker,
       raw_text: rawText,
       action_type_hint: actionType,
+      ...(scopedActionHint ? { event_type_hint: eventType } : {}),
       action_name_hint: figures.actionName,
       sub_type_hint: figures.subType,
       skill_name_hint: figures.skillName,
+      ...(rollPayload ? { roll: rollPayload } : {}),
       roll_total_hint: rollTotal,
       roll_natural_hint: rollNatural,
       roll_mode_hint: figures.rollMode,
@@ -2665,9 +2720,7 @@
       is_advantage_hint: figures.rollMode === 'advantage',
       is_disadvantage_hint: figures.rollMode === 'disadvantage',
     };
-    const scopedActionHint = resolveScopedActionEventTypeHint(mappingProfile, msg);
     if (scopedActionHint) {
-      msg.event_type_hint = scopedActionHint.eventType;
       msg.scoped_pattern_hint = scopedActionHint.pattern;
     }
     if (speaker && speaker !== 'Roll20' && (hadExplicitSpeaker || lastResolvedChatSpeaker)) {

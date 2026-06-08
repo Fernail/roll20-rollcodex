@@ -90,6 +90,11 @@ jobs:
         run: |
           set -euo pipefail
           test -f "${ZIP_PATH}"
+          verify_dir="$(mktemp -d)"
+          unzip -q "${ZIP_PATH}" -d "${verify_dir}"
+          node --check "${verify_dir}/background.js"
+          node --check "${verify_dir}/roll20-content.js"
+          node --check "${verify_dir}/rollcodex-content.js"
           unzip -p "${ZIP_PATH}" manifest.json > manifest.store.json
           node -e "const fs = require('node:fs'); const manifest = JSON.parse(fs.readFileSync('manifest.store.json', 'utf8')); if (manifest.version !== '${{ steps.release.outputs.version }}') process.exit(1);"
           if unzip -p "${ZIP_PATH}" manifest.json background.js roll20-content.js rollcodex-content.js | grep -E "localhost|127\.0\.0\.1|localtest\.me|rollledger\.vercel\.app"; then

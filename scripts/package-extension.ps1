@@ -8,7 +8,7 @@ $ErrorActionPreference = "Stop"
 
 $root = Split-Path -Parent $PSScriptRoot
 $manifestPath = Join-Path $root "manifest.json"
-$manifest = Get-Content -Raw -Path $manifestPath | ConvertFrom-Json
+$manifest = Get-Content -Raw -Encoding UTF8 -Path $manifestPath | ConvertFrom-Json
 $version = $manifest.version
 $channelName = $Channel.ToLowerInvariant()
 if ($channelName -eq "store" -or $channelName -eq "dev") {
@@ -104,7 +104,7 @@ function Set-BrowserManifest($target, $browser) {
 }
 
 $stagedManifestPath = Join-Path $stagingPath "manifest.json"
-$stagedManifest = Get-Content -Raw -Path $stagedManifestPath | ConvertFrom-Json
+$stagedManifest = Get-Content -Raw -Encoding UTF8 -Path $stagedManifestPath | ConvertFrom-Json
 
 if ($releaseName -eq "store") {
   $stagedManifest.host_permissions = @(
@@ -120,7 +120,7 @@ if ($releaseName -eq "store") {
   }
 
   $roll20ContentPath = Join-Path $stagingPath "roll20-content.js"
-  $roll20Content = Get-Content -Raw -Path $roll20ContentPath
+  $roll20Content = Get-Content -Raw -Encoding UTF8 -Path $roll20ContentPath
   $devBaseUrl = "const ROLLCODEX_APP_BASE_URL = 'http://localhost:5173';"
   $storeBaseUrl = "const ROLLCODEX_APP_BASE_URL = 'https://rollcodex.app';"
   if (-not $roll20Content.Contains($devBaseUrl)) {
@@ -130,7 +130,7 @@ if ($releaseName -eq "store") {
   [System.IO.File]::WriteAllText($roll20ContentPath, $roll20Content, $utf8NoBom)
 
   $backgroundPath = Join-Path $stagingPath "background.js"
-  $backgroundContent = Get-Content -Raw -Path $backgroundPath
+  $backgroundContent = Get-Content -Raw -Encoding UTF8 -Path $backgroundPath
   $localEndpointPattern = "\s+const isLocal = host === 'localhost' \|\| host === '127\.0\.0\.1';\r?\n\s+const isSupabase = host\.endsWith\('\.supabase\.co'\);\r?\n\s+return \['http:', 'https:'\]\.includes\(url\.protocol\)\r?\n\s+&& \(isLocal \|\| isSupabase\)"
   $storeEndpointGuard = "`n      const isSupabase = host.endsWith('.supabase.co');`n      return url.protocol === 'https:'`n        && isSupabase"
   $patchedBackgroundContent = $backgroundContent -replace $localEndpointPattern, $storeEndpointGuard
