@@ -3040,7 +3040,10 @@
         rollcodex_mapping_snapshot: buildRoll20MappingSnapshot(messages),
         mapping_hint_count: mappingHints.length,
       },
-      messages: messages.map(({ key: _key, ...message }) => message),
+      messages: messages.map(({ key, ...message }) => ({
+        ...message,
+        message_id: key || null,
+      })),
       mapping_hints: mappingHints,
     };
   }
