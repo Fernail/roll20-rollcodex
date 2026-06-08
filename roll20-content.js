@@ -8,7 +8,7 @@
   const BRIDGE_COMMAND_PREFIX = '!rollcodex bridge ';
   const BRIDGE_SNAPSHOT_MARKER = 'ROLLCODEX_BRIDGE_SNAPSHOT:';
   const BRIDGE_SNAPSHOT_TYPE = 'rollcodex:roll20-bridge-snapshot';
-  const BRIDGE_VERSION = '0.4.2';
+  const BRIDGE_VERSION = '0.4.3';
   const ROLLCODEX_APP_BASE_URL = 'http://localhost:5173';
   const ROLLCODEX_CONNECT_PATH = '/vtt/connect/roll20';
   const PENDING_PAIRING_KEY = 'rollcodexExtensionPendingPairing';
@@ -796,8 +796,32 @@
     return label;
   }
 
+  function getVisibleViewerWhisperTargets() {
+    const targets = new Map();
+    document.querySelectorAll('.player:not([data-is_gm="true"]) .player-name, .player:not([data-is_gm="true"]) .display-name').forEach((node) => {
+      const label = normalizeViewerRequesterLabel(node?.textContent);
+      if (label) targets.set(label.toLowerCase(), label);
+    });
+    return Array.from(targets.values());
+  }
+
   function getKnownViewerWhisperTargets() {
     return Array.from(knownViewerWhisperTargets.values());
+  }
+
+  function getViewerBroadcastTargets(explicitTarget = '') {
+    const target = normalizeViewerWhisperTarget(explicitTarget);
+    if (target) return [target];
+    const targets = new Map();
+    getKnownViewerWhisperTargets().forEach((label) => {
+      const normalized = normalizeViewerRequesterLabel(label);
+      if (normalized) targets.set(normalized.toLowerCase(), normalized);
+    });
+    getVisibleViewerWhisperTargets().forEach((label) => {
+      const normalized = normalizeViewerRequesterLabel(label);
+      if (normalized) targets.set(normalized.toLowerCase(), normalized);
+    });
+    return Array.from(targets.values());
   }
 
   function buildRoll20WhisperCommand(targetLabel, message) {
@@ -3374,8 +3398,7 @@
     if (!isRoll20TablePage()) return false;
     const payload = buildViewerBroadcastPayload(connection, profile, { reason });
     if (!payload) return false;
-    const explicitTarget = normalizeViewerWhisperTarget(options.targetLabel || '');
-    const targets = explicitTarget ? [explicitTarget] : getKnownViewerWhisperTargets();
+    const targets = getViewerBroadcastTargets(options.targetLabel || '');
     if (!targets.length) return false;
     return targets.some((target) => sendViewerBridgePayloadToTarget(payload, target));
   }
@@ -3397,8 +3420,7 @@
         roll20_scope_key: connection.roll20_scope_key || '',
       },
     };
-    const explicitTarget = normalizeViewerWhisperTarget(options.targetLabel || '');
-    const targets = explicitTarget ? [explicitTarget] : getKnownViewerWhisperTargets();
+    const targets = getViewerBroadcastTargets(options.targetLabel || '');
     knownViewerWhisperTargets.clear();
     lastViewerRequestRespondedAtByTarget.clear();
     if (!targets.length) return false;
