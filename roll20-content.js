@@ -8,7 +8,7 @@
   const BRIDGE_COMMAND_PREFIX = '!rollcodex bridge ';
   const BRIDGE_SNAPSHOT_MARKER = 'ROLLCODEX_BRIDGE_SNAPSHOT:';
   const BRIDGE_SNAPSHOT_TYPE = 'rollcodex:roll20-bridge-snapshot';
-  const BRIDGE_VERSION = '0.4.4';
+  const BRIDGE_VERSION = '0.4.6';
   const ROLLCODEX_APP_BASE_URL = 'http://localhost:5173';
   const ROLLCODEX_CONNECT_PATH = '/vtt/connect/roll20';
   const PENDING_PAIRING_KEY = 'rollcodexExtensionPendingPairing';
@@ -129,6 +129,10 @@
 
   function normalizeText(value) {
     return String(value || '').replace(/\s+/g, ' ').trim();
+  }
+
+  function delay(ms) {
+    return new Promise((resolve) => window.setTimeout(resolve, ms));
   }
 
   function isRoll20TablePage() {
@@ -1299,7 +1303,9 @@
   function isPlaceholderGameTitle(value) {
     const normalized = normalizeText(value).toLowerCase();
     if (!normalized) return true;
-    if (/^(roll20|loading|chargement|campagne|campaign)$/.test(normalized)) return true;
+    // Tolere la ponctuation/ellipsis finale : sous Jumpgate le h1 vaut "Chargement..."
+    // pendant et apres le chargement, ce qui doit rester un placeholder.
+    if (/^(roll20|loading|chargement|campagne|campaign)[\s.…]*$/.test(normalized)) return true;
     if (/\b(virtual tabletop|online tabletop|play d&d|play dnd|character sheet|lfg)\b/.test(normalized)) return true;
     if (/\bapp\.roll20\.net\b/.test(normalized)) return true;
     return false;
@@ -2139,10 +2145,15 @@
   }
 
   function getRoll20GameTitle() {
-    const title = normalizeText(document.querySelector('.campaign-title, [class*="campaign"] h1, h1')?.textContent);
-    if (title && !isPlaceholderGameTitle(title)) return title;
+    // document.title ("Nom de campagne | Roll20") est la source la plus stable et
+    // identique entre MJ et joueur, y compris sous Jumpgate ou le DOM n'est pas
+    // fiable (h1 = "Chargement..." pendant et apres le chargement, .campaign-title absent).
+    // On le prefere au DOM pour que le scope de table (title:<titre>) concorde des deux cotes.
     const pageTitle = normalizeText(document.title).replace(/\s*\|\s*Roll20.*$/i, '');
-    return pageTitle && !isPlaceholderGameTitle(pageTitle) ? pageTitle : 'Roll20';
+    if (pageTitle && !isPlaceholderGameTitle(pageTitle)) return pageTitle;
+    const domTitle = normalizeText(document.querySelector('.campaign-title, [class*="campaign"] h1, h1')?.textContent);
+    if (domTitle && !isPlaceholderGameTitle(domTitle)) return domTitle;
+    return 'Roll20';
   }
 
   function extractRoll20CampaignIdFromUrl(value) {
@@ -3467,7 +3478,7 @@
     };
   }
 
-  function sendViewerBroadcastRequest() {
+  async function sendViewerBroadcastRequest() {
     if (isCurrentUserRoll20Gm()) return false;
     if (!isRoll20TablePage()) return false;
     const now = Date.now();
@@ -3476,6 +3487,7 @@
     const playerLabel = normalizeViewerRequesterLabel(playerOption?.textContent) || getCurrentRoll20PlayerLabel();
     const speakingAsRestore = setSpeakingAsOption(playerOption);
     try {
+      if (speakingAsRestore?.changed) await delay(350);
       const payload = buildViewerRequestPayload(playerLabel);
       const marker = `${VIEWER_BROADCAST_MARKER}${encodeViewerBroadcast(payload)}`;
       const result = sendChatCommand(buildRoll20WhisperCommand('gm', marker));
@@ -3488,7 +3500,7 @@
           speakingAsRestore.select.value = speakingAsRestore.previous;
           speakingAsRestore.select.dispatchEvent(new Event('input', { bubbles: true }));
           speakingAsRestore.select.dispatchEvent(new Event('change', { bubbles: true }));
-        }, 750);
+        }, 1250);
       }
     }
   }
