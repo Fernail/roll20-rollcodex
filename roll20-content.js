@@ -8,7 +8,7 @@
   const BRIDGE_COMMAND_PREFIX = '!rollcodex bridge ';
   const BRIDGE_SNAPSHOT_MARKER = 'ROLLCODEX_BRIDGE_SNAPSHOT:';
   const BRIDGE_SNAPSHOT_TYPE = 'rollcodex:roll20-bridge-snapshot';
-  const BRIDGE_VERSION = '0.4.3';
+  const BRIDGE_VERSION = '0.4.4';
   const ROLLCODEX_APP_BASE_URL = 'http://localhost:5173';
   const ROLLCODEX_CONNECT_PATH = '/vtt/connect/roll20';
   const PENDING_PAIRING_KEY = 'rollcodexExtensionPendingPairing';
@@ -735,6 +735,16 @@
     );
   }
 
+  function getOwnSpeakingAsPlayerOption() {
+    const options = document.querySelectorAll('#speakingas option');
+    for (const opt of options) {
+      if (!String(opt.value || '').startsWith('player|')) continue;
+      const label = normalizeText(opt.textContent);
+      if (label && !isGmSpeakerLabel(label)) return opt;
+    }
+    return null;
+  }
+
   function getOwnSpeakingAsLabel() {
     // Le dropdown "En tant que" / "Speaking as" expose toujours une option
     // value="player|<monUserId>" text="<mon nom>". Roll20 suffixe ce texte par
@@ -742,13 +752,18 @@
     // le plus stable pour distinguer MJ et joueur sans dependre du chat ni des
     // tuiles video (dont le textContent inclut le label "Rejoindre le chat audio
     // et video" qui pollue la lecture).
-    const options = document.querySelectorAll('#speakingas option');
-    for (const opt of options) {
-      if (String(opt.value || '').startsWith('player|')) {
-        return normalizeText(opt.textContent);
-      }
-    }
-    return '';
+    return normalizeText(getOwnSpeakingAsPlayerOption()?.textContent);
+  }
+
+  function setSpeakingAsOption(option) {
+    const select = option?.closest?.('select') || document.querySelector('#speakingas');
+    if (!select || !option?.value) return null;
+    const previous = select.value;
+    if (previous === option.value) return { select, previous, changed: false };
+    select.value = option.value;
+    select.dispatchEvent(new Event('input', { bubbles: true }));
+    select.dispatchEvent(new Event('change', { bubbles: true }));
+    return { select, previous, changed: true };
   }
 
   function normalizeRoll20PlayerLabel(value) {
@@ -796,32 +811,8 @@
     return label;
   }
 
-  function getVisibleViewerWhisperTargets() {
-    const targets = new Map();
-    document.querySelectorAll('.player:not([data-is_gm="true"]) .player-name, .player:not([data-is_gm="true"]) .display-name').forEach((node) => {
-      const label = normalizeViewerRequesterLabel(node?.textContent);
-      if (label) targets.set(label.toLowerCase(), label);
-    });
-    return Array.from(targets.values());
-  }
-
   function getKnownViewerWhisperTargets() {
     return Array.from(knownViewerWhisperTargets.values());
-  }
-
-  function getViewerBroadcastTargets(explicitTarget = '') {
-    const target = normalizeViewerWhisperTarget(explicitTarget);
-    if (target) return [target];
-    const targets = new Map();
-    getKnownViewerWhisperTargets().forEach((label) => {
-      const normalized = normalizeViewerRequesterLabel(label);
-      if (normalized) targets.set(normalized.toLowerCase(), normalized);
-    });
-    getVisibleViewerWhisperTargets().forEach((label) => {
-      const normalized = normalizeViewerRequesterLabel(label);
-      if (normalized) targets.set(normalized.toLowerCase(), normalized);
-    });
-    return Array.from(targets.values());
   }
 
   function buildRoll20WhisperCommand(targetLabel, message) {
@@ -3398,7 +3389,8 @@
     if (!isRoll20TablePage()) return false;
     const payload = buildViewerBroadcastPayload(connection, profile, { reason });
     if (!payload) return false;
-    const targets = getViewerBroadcastTargets(options.targetLabel || '');
+    const explicitTarget = normalizeViewerWhisperTarget(options.targetLabel || '');
+    const targets = explicitTarget ? [explicitTarget] : getKnownViewerWhisperTargets();
     if (!targets.length) return false;
     return targets.some((target) => sendViewerBridgePayloadToTarget(payload, target));
   }
@@ -3420,7 +3412,8 @@
         roll20_scope_key: connection.roll20_scope_key || '',
       },
     };
-    const targets = getViewerBroadcastTargets(options.targetLabel || '');
+    const explicitTarget = normalizeViewerWhisperTarget(options.targetLabel || '');
+    const targets = explicitTarget ? [explicitTarget] : getKnownViewerWhisperTargets();
     knownViewerWhisperTargets.clear();
     lastViewerRequestRespondedAtByTarget.clear();
     if (!targets.length) return false;
@@ -3461,13 +3454,13 @@
     return Boolean(stamp && Date.now() - stamp <= VIEWER_BROADCAST_STALE_MS);
   }
 
-  function buildViewerRequestPayload() {
+  function buildViewerRequestPayload(requesterLabel = '') {
     return {
       type: VIEWER_REQUEST_TYPE,
       version: 1,
       requested_at: new Date().toISOString(),
       token: randomHex(8),
-      requester_label: getCurrentRoll20PlayerLabel(),
+      requester_label: normalizeViewerRequesterLabel(requesterLabel) || getCurrentRoll20PlayerLabel(),
       roll20_scope_key: getRoll20DurableStorageScope(),
       roll20_game_id: getRoll20GameId(),
       roll20_game_title: getRoll20GameTitle(),
@@ -3479,12 +3472,25 @@
     if (!isRoll20TablePage()) return false;
     const now = Date.now();
     if (now - lastViewerRequestSentAt < VIEWER_REQUEST_MIN_INTERVAL_MS) return false;
-    const payload = buildViewerRequestPayload();
-    const marker = `${VIEWER_BROADCAST_MARKER}${encodeViewerBroadcast(payload)}`;
-    const result = sendChatCommand(buildRoll20WhisperCommand('gm', marker));
-    const sent = Boolean(result?.ok);
-    if (sent) lastViewerRequestSentAt = now;
-    return sent;
+    const playerOption = getOwnSpeakingAsPlayerOption();
+    const playerLabel = normalizeViewerRequesterLabel(playerOption?.textContent) || getCurrentRoll20PlayerLabel();
+    const speakingAsRestore = setSpeakingAsOption(playerOption);
+    try {
+      const payload = buildViewerRequestPayload(playerLabel);
+      const marker = `${VIEWER_BROADCAST_MARKER}${encodeViewerBroadcast(payload)}`;
+      const result = sendChatCommand(buildRoll20WhisperCommand('gm', marker));
+      const sent = Boolean(result?.ok);
+      if (sent) lastViewerRequestSentAt = now;
+      return sent;
+    } finally {
+      if (speakingAsRestore?.changed) {
+        window.setTimeout(() => {
+          speakingAsRestore.select.value = speakingAsRestore.previous;
+          speakingAsRestore.select.dispatchEvent(new Event('input', { bubbles: true }));
+          speakingAsRestore.select.dispatchEvent(new Event('change', { bubbles: true }));
+        }, 750);
+      }
+    }
   }
 
   function clearViewerRequestTimer() {
