@@ -8,7 +8,7 @@
   const BRIDGE_COMMAND_PREFIX = '!rollcodex bridge ';
   const BRIDGE_SNAPSHOT_MARKER = 'ROLLCODEX_BRIDGE_SNAPSHOT:';
   const BRIDGE_SNAPSHOT_TYPE = 'rollcodex:roll20-bridge-snapshot';
-  const BRIDGE_VERSION = '0.4.0';
+  const BRIDGE_VERSION = '0.4.1';
   const ROLLCODEX_APP_BASE_URL = 'http://localhost:5173';
   const ROLLCODEX_CONNECT_PATH = '/vtt/connect/roll20';
   const PENDING_PAIRING_KEY = 'rollcodexExtensionPendingPairing';
