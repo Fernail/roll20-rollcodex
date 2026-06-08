@@ -8,7 +8,7 @@
   const BRIDGE_COMMAND_PREFIX = '!rollcodex bridge ';
   const BRIDGE_SNAPSHOT_MARKER = 'ROLLCODEX_BRIDGE_SNAPSHOT:';
   const BRIDGE_SNAPSHOT_TYPE = 'rollcodex:roll20-bridge-snapshot';
-  const BRIDGE_VERSION = '0.4.1';
+  const BRIDGE_VERSION = '0.4.2';
   const ROLLCODEX_APP_BASE_URL = 'http://localhost:5173';
   const ROLLCODEX_CONNECT_PATH = '/vtt/connect/roll20';
   const PENDING_PAIRING_KEY = 'rollcodexExtensionPendingPairing';
@@ -24,10 +24,13 @@
   const VIEWER_BROADCAST_TYPE = 'rollcodex:roll20-viewer-broadcast';
   const VIEWER_REQUEST_TYPE = 'rollcodex:roll20-viewer-request';
   const VIEWER_BROADCAST_HEARTBEAT_MS = 5 * 60 * 1000;
+  const VIEWER_BROADCAST_STALE_MS = VIEWER_BROADCAST_HEARTBEAT_MS * 2 + 30000;
   const VIEWER_BROADCAST_MAX_MARKER_LENGTH = 8800;
   const VIEWER_BROADCAST_CACHE_KEY = 'rollcodexExtensionViewerBroadcast';
   const VIEWER_REQUEST_RETRY_DELAYS_MS = [1500, 5000, 15000, 45000];
   const VIEWER_REQUEST_PERIODIC_MS = 60 * 1000;
+  const VIEWER_REQUEST_MIN_INTERVAL_MS = 4000;
+  const VIEWER_STARTUP_RESYNC_MS = 2500;
   const VIEWER_REQUEST_RESPONSE_DEBOUNCE_MS = 2000;
   const PANEL_COLORS = {
     bg: 'rgba(17,13,12,.96)',
@@ -62,6 +65,8 @@
   let viewerChatObserver = null;
   let viewerHeartbeatTimer = null;
   let viewerRequestTimer = null;
+  let viewerStartupResyncTimer = null;
+  let lastViewerRequestSentAt = 0;
   let autoCaptureInFlight = false;
   let extensionContextInvalidated = false;
   let cachedTabScope = '';
@@ -774,8 +779,18 @@
     return label;
   }
 
+  function normalizeViewerRequesterLabel(value) {
+    const label = normalizeViewerWhisperTarget(value)
+      .replace(/^\(?\s*(?:from|de)\s+/i, '')
+      .replace(/\s+\(?\s*(?:to|pour|a|à)\s+(?:gm|mj|dm|md)\s*\)?$/i, '')
+      .replace(/\s*\)\s*$/g, '')
+      .trim();
+    if (!label || isGmSpeakerLabel(label) || /^(?:gm|mj|dm|md)$/i.test(label)) return '';
+    return normalizeViewerWhisperTarget(label);
+  }
+
   function rememberViewerWhisperTarget(value) {
-    const label = normalizeViewerWhisperTarget(value);
+    const label = normalizeViewerRequesterLabel(value);
     if (!label) return '';
     knownViewerWhisperTargets.set(label.toLowerCase(), label);
     return label;
@@ -3102,6 +3117,10 @@
 
   function stopViewerObservers() {
     clearViewerRequestTimer();
+    if (viewerStartupResyncTimer) {
+      window.clearTimeout(viewerStartupResyncTimer);
+      viewerStartupResyncTimer = null;
+    }
     if (viewerBroadcastObserver) {
       viewerBroadcastObserver.disconnect();
       viewerBroadcastObserver = null;
@@ -3305,22 +3324,41 @@
   }
 
   function buildViewerBridgeMarker(payload) {
-    const encoded = encodeViewerBroadcast(payload);
-    const marker = `${VIEWER_BROADCAST_MARKER}${encoded}`;
+    const buildMarker = (candidate) => `${VIEWER_BROADCAST_MARKER}${encodeViewerBroadcast(candidate)}`;
+    const marker = buildMarker(payload);
     if (marker.length <= VIEWER_BROADCAST_MAX_MARKER_LENGTH) {
       return marker;
     }
     // Profil trop volumineux pour le chat Roll20 : on tronque metriques/mappings
     // pour rester sous la limite. Le lecteur n'aura qu'une vue partielle mais
     // utilisable (les premieres entrees sont les plus pertinentes par sort_order).
-    const trimmedProfile = payload.profile ? {
-      ...payload.profile,
-      metrics: (payload.profile.metrics || []).slice(0, 24),
-      mappings: (payload.profile.mappings || []).slice(0, 48),
-      speaker_roles: (payload.profile.speaker_roles || []).slice(0, 48),
-    } : null;
-    const trimmed = { ...payload, profile: trimmedProfile, truncated: true };
-    return `${VIEWER_BROADCAST_MARKER}${encodeViewerBroadcast(trimmed)}`;
+    const trimAttempts = [
+      { metrics: 24, mappings: 48, speakerRoles: 48 },
+      { metrics: 12, mappings: 24, speakerRoles: 24 },
+      { metrics: 6, mappings: 12, speakerRoles: 12 },
+      { metrics: 3, mappings: 6, speakerRoles: 6 },
+      { metrics: 0, mappings: 0, speakerRoles: 0 },
+    ];
+
+    for (const attempt of trimAttempts) {
+      const trimmedProfile = payload.profile ? {
+        schema_version: payload.profile.schema_version || null,
+        last_updated_at: payload.profile.last_updated_at || null,
+        metrics: (payload.profile.metrics || []).slice(0, attempt.metrics),
+        mappings: (payload.profile.mappings || []).slice(0, attempt.mappings),
+        speaker_roles: (payload.profile.speaker_roles || []).slice(0, attempt.speakerRoles),
+      } : null;
+      const trimmed = { ...payload, profile: trimmedProfile, truncated: true };
+      const trimmedMarker = buildMarker(trimmed);
+      if (trimmedMarker.length <= VIEWER_BROADCAST_MAX_MARKER_LENGTH) return trimmedMarker;
+    }
+
+    return buildMarker({
+      ...payload,
+      profile: null,
+      truncated: true,
+      truncation_reason: 'viewer_marker_limit',
+    });
   }
 
   function sendViewerBridgePayloadToTarget(payload, targetLabel) {
@@ -3389,6 +3427,18 @@
     }
   }
 
+  function getViewerBroadcastStamp(payload, fallback = '') {
+    const emittedAt = Date.parse(payload?.emitted_at || '');
+    if (Number.isFinite(emittedAt)) return emittedAt;
+    const fallbackAt = Date.parse(fallback || '');
+    return Number.isFinite(fallbackAt) ? fallbackAt : 0;
+  }
+
+  function hasRecentViewerBroadcast() {
+    const stamp = getViewerBroadcastStamp(viewerState.broadcast);
+    return Boolean(stamp && Date.now() - stamp <= VIEWER_BROADCAST_STALE_MS);
+  }
+
   function buildViewerRequestPayload() {
     return {
       type: VIEWER_REQUEST_TYPE,
@@ -3405,10 +3455,14 @@
   function sendViewerBroadcastRequest() {
     if (isCurrentUserRoll20Gm()) return false;
     if (!isRoll20TablePage()) return false;
+    const now = Date.now();
+    if (now - lastViewerRequestSentAt < VIEWER_REQUEST_MIN_INTERVAL_MS) return false;
     const payload = buildViewerRequestPayload();
     const marker = `${VIEWER_BROADCAST_MARKER}${encodeViewerBroadcast(payload)}`;
     const result = sendChatCommand(buildRoll20WhisperCommand('gm', marker));
-    return Boolean(result?.ok);
+    const sent = Boolean(result?.ok);
+    if (sent) lastViewerRequestSentAt = now;
+    return sent;
   }
 
   function clearViewerRequestTimer() {
@@ -3418,26 +3472,33 @@
   }
 
   function scheduleViewerBroadcastRequests() {
+    if (viewerRequestTimer) return;
     VIEWER_REQUEST_RETRY_DELAYS_MS.forEach((delay) => {
       window.setTimeout(() => {
         if (!isRoll20TablePage()) return;
         if (currentRuntimeMode !== 'viewer') return;
-        if (viewerState.broadcast) return;
+        if (hasRecentViewerBroadcast()) return;
         sendViewerBroadcastRequest();
       }, delay);
     });
-    if (viewerRequestTimer) return;
     viewerRequestTimer = window.setInterval(() => {
       if (!isRoll20TablePage() || currentRuntimeMode !== 'viewer') {
         clearViewerRequestTimer();
         return;
       }
-      if (viewerState.broadcast) {
-        clearViewerRequestTimer();
-        return;
-      }
+      if (hasRecentViewerBroadcast()) return;
       sendViewerBroadcastRequest();
     }, VIEWER_REQUEST_PERIODIC_MS);
+  }
+
+  function scheduleViewerStartupResync() {
+    if (viewerStartupResyncTimer) window.clearTimeout(viewerStartupResyncTimer);
+    viewerStartupResyncTimer = window.setTimeout(() => {
+      viewerStartupResyncTimer = null;
+      if (!isRoll20TablePage()) return;
+      if (currentRuntimeMode !== 'viewer') return;
+      sendViewerBroadcastRequest();
+    }, VIEWER_STARTUP_RESYNC_MS);
   }
 
   async function handleViewerRequest(payload) {
@@ -3504,7 +3565,7 @@
     }
     viewerState.broadcast = payload;
     viewerState.lastSeenAt = stamp;
-    clearViewerRequestTimer();
+    scheduleViewerBroadcastRequests();
     setStorageValues({
       [VIEWER_BROADCAST_CACHE_KEY]: {
         roll20_scope_key: payload.connection?.roll20_scope_key || '',
@@ -3521,6 +3582,14 @@
     return element.closest?.(
       '#textchat [data-messageid], #textchat [data-message-id], #textchat .message, #textchat .textchatmessage, #textchat .chat-message'
     );
+  }
+
+  function getViewerRequestSenderLabel(root) {
+    const row = findViewerBridgeChatRow(root);
+    if (!row) return '';
+    const sender = getChatSender(row);
+    const textSpeaker = getSpeakerFromText(getNodeReadableText(row));
+    return normalizeViewerRequesterLabel(sender || textSpeaker);
   }
 
   function hideViewerBridgeChatRows(root = document.body) {
@@ -3551,12 +3620,15 @@
       const token = match[1];
       if (!processedViewerBroadcasts.has(token)) {
         const payload = decodeViewerBroadcast(token);
-        const shouldApplyBroadcast = payload?.type === VIEWER_BROADCAST_TYPE && currentRuntimeMode === 'viewer';
-        const shouldHandleRequest = payload?.type === VIEWER_REQUEST_TYPE && currentRuntimeMode === 'gm';
+        const requestPayload = payload?.type === VIEWER_REQUEST_TYPE && !normalizeViewerRequesterLabel(payload.requester_label)
+          ? { ...payload, requester_label: getViewerRequestSenderLabel(root) }
+          : payload;
+        const shouldApplyBroadcast = requestPayload?.type === VIEWER_BROADCAST_TYPE && currentRuntimeMode === 'viewer';
+        const shouldHandleRequest = requestPayload?.type === VIEWER_REQUEST_TYPE && currentRuntimeMode === 'gm';
         if (shouldApplyBroadcast || shouldHandleRequest) {
           processedViewerBroadcasts.add(token);
-          if (shouldApplyBroadcast) applyViewerBroadcast(payload, { allowWeakChatRelay: true });
-          else handleViewerRequest(payload);
+          if (shouldApplyBroadcast) applyViewerBroadcast(requestPayload, { allowWeakChatRelay: true });
+          else handleViewerRequest(requestPayload);
         }
       }
       match = pattern.exec(text);
@@ -3602,8 +3674,11 @@
     const stored = await getStorageValue(VIEWER_BROADCAST_CACHE_KEY);
     if (!stored?.payload) return;
     if (!viewerBroadcastMatchesCurrentTable(stored.payload)) return;
-    const emittedAt = Date.parse(stored.payload?.emitted_at || stored.cached_at || '');
-    const stamp = Number.isFinite(emittedAt) ? emittedAt : Date.parse(stored.cached_at || '') || Date.now();
+    const stamp = getViewerBroadcastStamp(stored.payload, stored.cached_at);
+    if (!stamp || Date.now() - stamp > VIEWER_BROADCAST_STALE_MS) {
+      removeStorageValue(VIEWER_BROADCAST_CACHE_KEY).catch(() => null);
+      return;
+    }
     if (stamp > viewerState.lastSeenAt) {
       viewerState.broadcast = stored.payload;
       viewerState.lastSeenAt = stamp;
@@ -3679,6 +3754,7 @@
       loadCachedViewerBroadcast().then(() => {
         refreshViewerPanel(`Mode lecteur (${reason})`);
         scheduleViewerBroadcastRequests();
+        scheduleViewerStartupResync();
       });
     } else {
       // Bascule lecteur -> MJ (rare : reconnexion du MJ apres incertitude DOM).
@@ -3719,6 +3795,7 @@
       await loadCachedViewerBroadcast();
       refreshViewerPanel();
       scheduleViewerBroadcastRequests();
+      scheduleViewerStartupResync();
     }, 800);
     scheduleRuntimeModeRetries('post-startup');
   } else {
