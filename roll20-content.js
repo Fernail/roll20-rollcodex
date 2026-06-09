@@ -9,7 +9,7 @@
   const BRIDGE_COMMAND_PREFIX = '!rollcodex bridge ';
   const BRIDGE_SNAPSHOT_MARKER = 'ROLLCODEX_BRIDGE_SNAPSHOT:';
   const BRIDGE_SNAPSHOT_TYPE = 'rollcodex:roll20-bridge-snapshot';
-  const BRIDGE_VERSION = '0.4.7';
+  const BRIDGE_VERSION = '0.4.8';
   const ROLLCODEX_APP_BASE_URL = 'http://localhost:5173';
   const ROLLCODEX_CONNECT_PATH = '/vtt/connect/roll20';
   const PENDING_PAIRING_KEY = 'rollcodexExtensionPendingPairing';
@@ -33,6 +33,7 @@
   const VIEWER_REQUEST_MIN_INTERVAL_MS = 4000;
   const VIEWER_STARTUP_RESYNC_MS = 2500;
   const VIEWER_REQUEST_RESPONSE_DEBOUNCE_MS = 2000;
+  const VIEWER_LIVE_BROADCAST_MIN_INTERVAL_MS = 12000;
   const PANEL_COLORS = {
     bg: 'rgba(17,13,12,.96)',
     bgSoft: 'rgba(24,18,17,.72)',
@@ -67,6 +68,8 @@
   let viewerHeartbeatTimer = null;
   let viewerRequestTimer = null;
   let viewerStartupResyncTimer = null;
+  let liveBroadcastTimer = null;
+  let lastLiveBroadcastAt = 0;
   let lastViewerRequestSentAt = 0;
   let autoCaptureInFlight = false;
   let extensionContextInvalidated = false;
@@ -2495,6 +2498,28 @@
     panel.querySelector('[data-rollcodex-kiki-select]')?.addEventListener('change', (event) => setKikimeterMetric(event.target.value));
   }
 
+  function buildViewerLiveSummaryFromBroadcast(broadcast, selectedMetricId) {
+    const summary = broadcast?.live_summary;
+    if (!summary || !Array.isArray(summary.metrics)) return null;
+    const orderedMetrics = summary.metrics
+      .slice()
+      .sort((left, right) => (Number(left.sort_order) || 0) - (Number(right.sort_order) || 0)
+        || String(left.label || '').localeCompare(String(right.label || '')));
+    const profileMetrics = orderedMetrics.map((metric) => ({ id: metric.id, label: metric.label }));
+    const selectedMetric = getSelectedProfileMetric(profileMetrics, selectedMetricId);
+    const selectedFull = orderedMetrics.find((metric) => metric.id === selectedMetric?.id) || orderedMetrics[0] || null;
+    return {
+      totals: summary.totals || createEmptyLiveMetricTotals(),
+      top_participants: [],
+      profile_metrics: profileMetrics,
+      selected_metric: selectedMetric,
+      leaderboard: Array.isArray(selectedFull?.leaderboard) ? selectedFull.leaderboard : [],
+      metric_result: selectedFull?.metric_result || null,
+      metric_status: profileMetrics.length ? '' : 'En attente des mesures du MJ',
+      recent_events: [],
+    };
+  }
+
   async function refreshViewerPanel(status = '') {
     if (!isRoll20TablePage()) {
       cleanupNonTablePage();
@@ -2506,14 +2531,21 @@
     const profile = broadcast?.profile || null;
     const connection = broadcast?.connection ? { ...broadcast.connection, is_viewer: true } : null;
     currentMappingProfile = profile;
-    const visibleMessages = getChatRows().map((node, index) => normalizeChatRow(node, index, profile)).filter(Boolean);
-    rebuildLiveMetricsFromMessages(dedupeNormalizedMessages(visibleMessages));
+    // Source de verite : le classement precalcule par le MJ (parite d'affichage exacte).
+    let liveSummary = buildViewerLiveSummaryFromBroadcast(broadcast, kikimeterSettings.metric_id);
+    if (!liveSummary) {
+      // Repli pour un MJ sur ancienne version (broadcast sans live_summary) :
+      // recompute local depuis le chat visible du lecteur (vue partielle, best effort).
+      const visibleMessages = getChatRows().map((node, index) => normalizeChatRow(node, index, profile)).filter(Boolean);
+      rebuildLiveMetricsFromMessages(dedupeNormalizedMessages(visibleMessages));
+      liveSummary = summarizeLiveMetrics(profile, kikimeterSettings.metric_id, connection);
+    }
     renderViewerPanel({
       panelSettings,
       kikimeterSettings,
       connection,
       profile,
-      liveSummary: summarizeLiveMetrics(profile, kikimeterSettings.metric_id, connection),
+      liveSummary,
       status: status || (broadcast ? 'Lecture session MJ' : 'En attente du MJ...'),
     });
   }
@@ -3305,6 +3337,10 @@
 
   function stopViewerObservers() {
     clearViewerRequestTimer();
+    if (liveBroadcastTimer) {
+      window.clearTimeout(liveBroadcastTimer);
+      liveBroadcastTimer = null;
+    }
     if (viewerStartupResyncTimer) {
       window.clearTimeout(viewerStartupResyncTimer);
       viewerStartupResyncTimer = null;
@@ -3367,6 +3403,7 @@
       });
       if (!hasChatChange) return;
       refreshPanel();
+      scheduleLiveViewerBroadcast();
       scheduleAutoSnapshot('roll20_auto_chat_idle');
     });
     autoCaptureObserver.observe(root, { childList: true, subtree: true });
@@ -3484,6 +3521,47 @@
     };
   }
 
+  function slimBroadcastLeaderboardEntry(entry) {
+    return {
+      label: entry.label,
+      sourceLabel: entry.sourceLabel,
+      mapped: entry.mapped !== false,
+      value: Number(entry.value) || 0,
+      value_label: entry.value_label || '',
+      delta_label: entry.delta_label || '',
+    };
+  }
+
+  function slimBroadcastMetricResult(result) {
+    if (!result) return null;
+    return {
+      label: result.label || '',
+      count: result.count != null ? result.count : null,
+      delta_label: result.delta_label || '',
+    };
+  }
+
+  // Le MJ precalcule le classement de chaque mesure (baseline + live) pour que le
+  // lecteur affiche exactement la meme chose. Le lecteur ne peut pas reproduire ce
+  // calcul depuis son propre chat : le parsing des speakers depend du DOM MJ (panneau
+  // joueurs, marqueurs is_gm) souvent absent ou degrade cote joueur, surtout sous Jumpgate.
+  function buildBroadcastLiveSummary(profile) {
+    const metrics = getProfileMetrics(profile);
+    return {
+      totals: { ...liveMetricsState.totals },
+      metrics: metrics.map((metric) => {
+        const merged = computeBaselinePlusLive(profile, metric);
+        return {
+          id: metric.id,
+          label: metric.label,
+          sort_order: metric.sortOrder,
+          metric_result: slimBroadcastMetricResult(merged.metricResult),
+          leaderboard: (merged.leaderboard || []).map(slimBroadcastLeaderboardEntry),
+        };
+      }),
+    };
+  }
+
   function buildViewerBroadcastPayload(connection, profile, extra = {}) {
     if (!connection) return null;
     return {
@@ -3503,6 +3581,7 @@
         roll20_scope_key: connection.roll20_scope_key || '',
       },
       profile: sanitizeBroadcastProfile(profile),
+      live_summary: buildBroadcastLiveSummary(profile),
       ...extra,
     };
   }
@@ -3536,7 +3615,13 @@
         mappings: (payload.profile.mappings || []).slice(0, attempt.mappings),
         speaker_roles: (payload.profile.speaker_roles || []).slice(0, attempt.speakerRoles),
       } : null;
-      const trimmed = { ...payload, profile: trimmedProfile, truncated: true };
+      // On garde le classement precalcule en priorite (c'est ce que le lecteur affiche) :
+      // on borne le nombre de mesures mais on conserve leur leaderboard complet.
+      const trimmedLiveSummary = payload.live_summary ? {
+        totals: payload.live_summary.totals,
+        metrics: (payload.live_summary.metrics || []).slice(0, attempt.metrics),
+      } : null;
+      const trimmed = { ...payload, profile: trimmedProfile, live_summary: trimmedLiveSummary, truncated: true };
       const trimmedMarker = buildMarker(trimmed);
       if (trimmedMarker.length <= VIEWER_BROADCAST_MAX_MARKER_LENGTH) return trimmedMarker;
     }
@@ -3544,6 +3629,7 @@
     return buildMarker({
       ...payload,
       profile: null,
+      live_summary: null,
       truncated: true,
       truncation_reason: 'viewer_marker_limit',
     });
@@ -3591,6 +3677,35 @@
     lastViewerRequestRespondedAtByTarget.clear();
     if (!targets.length) return false;
     return targets.some((target) => sendViewerBridgePayloadToTarget(payload, target));
+  }
+
+  async function runLiveViewerBroadcast() {
+    if (!isRoll20TablePage() || currentRuntimeMode !== 'gm') return;
+    const connection = await getCurrentConnection();
+    if (!connection) return;
+    const profile = await getMappingProfile(connection).catch(() => null);
+    broadcastViewerSession(connection, profile, 'live_update');
+  }
+
+  // Rediffuse le classement MJ quand le chat evolue, pour que le lecteur reste aligne
+  // sans attendre le heartbeat. Throttle pour ne pas spammer le chat Roll20, et silencieux
+  // tant qu'aucun lecteur n'a demande la session (aucune cible de whisper connue).
+  function scheduleLiveViewerBroadcast() {
+    if (currentRuntimeMode !== 'gm') return;
+    if (!knownViewerWhisperTargets.size) return;
+    const now = Date.now();
+    const elapsed = now - lastLiveBroadcastAt;
+    if (elapsed >= VIEWER_LIVE_BROADCAST_MIN_INTERVAL_MS) {
+      lastLiveBroadcastAt = now;
+      runLiveViewerBroadcast();
+      return;
+    }
+    if (liveBroadcastTimer) return;
+    liveBroadcastTimer = window.setTimeout(() => {
+      liveBroadcastTimer = null;
+      lastLiveBroadcastAt = Date.now();
+      runLiveViewerBroadcast();
+    }, VIEWER_LIVE_BROADCAST_MIN_INTERVAL_MS - elapsed);
   }
 
   function scheduleViewerHeartbeat() {
