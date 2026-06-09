@@ -2,11 +2,12 @@
   const MESSAGE_CONFIRM = 'ROLLCODEX_ROLL20_CONFIRM';
   const MESSAGE_SEND_SNAPSHOT = 'ROLLCODEX_ROLL20_SEND_SNAPSHOT';
   const MESSAGE_FETCH_MAPPING_PROFILE = 'ROLLCODEX_ROLL20_FETCH_MAPPING_PROFILE';
+  const MESSAGE_FETCH_IMPORT_BOUNDARY = 'ROLLCODEX_ROLL20_FETCH_IMPORT_BOUNDARY';
   const MESSAGE_EXTENSION_CONNECTED = 'ROLLCODEX_ROLL20_EXTENSION_CONNECTED';
   const MESSAGE_SYNC_CONNECTION = 'ROLLCODEX_ROLL20_SYNC_CONNECTION';
   const MESSAGE_OPEN_CONNECT_PAGE = 'ROLLCODEX_ROLL20_OPEN_CONNECT_PAGE';
   const CONFIRM_PREFIX = '!rollcodex confirm ';
-  const BRIDGE_CLIENT = 'roll20-extension/0.4.6';
+  const BRIDGE_CLIENT = 'roll20-extension/0.4.7';
   const PENDING_PAIRING_KEY = 'rollcodexExtensionPendingPairing';
   const CONNECTION_KEY = 'rollcodexExtensionConnection';
 
@@ -252,6 +253,8 @@
     if (!pendingPairing.connectionSecret) return null;
     const mappingProfileEndpoint = String(payload.mappingProfileEndpoint || payload.mapping_profile_endpoint || '').trim();
     if (mappingProfileEndpoint && !isAllowedMappingProfileEndpoint(mappingProfileEndpoint)) return null;
+    const importBoundaryEndpoint = String(payload.importBoundaryEndpoint || payload.import_boundary_endpoint || '').trim();
+    if (importBoundaryEndpoint && !isAllowedImportBoundaryEndpoint(importBoundaryEndpoint)) return null;
     return enrichConnectionScope({
       provider: 'roll20',
       source_format: 'roll20_mod_json',
@@ -259,6 +262,7 @@
       connection_secret: pendingPairing.connectionSecret,
       endpoint: payload.endpoint,
       mapping_profile_endpoint: mappingProfileEndpoint,
+      import_boundary_endpoint: importBoundaryEndpoint,
       workspace_id: payload.workspaceId || payload.workspace_id || '',
       workspace_label: payload.workspaceLabel || payload.workspace_label || '',
       system_id: payload.systemId || payload.system_id || '',
@@ -276,8 +280,10 @@
     const connectionSecret = String(payload?.connectionSecret || payload?.connection_secret || '').trim();
     const endpoint = String(payload?.endpoint || '').trim();
     const mappingProfileEndpoint = String(payload?.mappingProfileEndpoint || payload?.mapping_profile_endpoint || '').trim();
+    const importBoundaryEndpoint = String(payload?.importBoundaryEndpoint || payload?.import_boundary_endpoint || '').trim();
     if (payload?.provider !== 'roll20' || !connectionId || !connectionSecret || !isAllowedSnapshotEndpoint(endpoint)) return null;
     if (mappingProfileEndpoint && !isAllowedMappingProfileEndpoint(mappingProfileEndpoint)) return null;
+    if (importBoundaryEndpoint && !isAllowedImportBoundaryEndpoint(importBoundaryEndpoint)) return null;
 
     return enrichConnectionScope({
       provider: 'roll20',
@@ -286,6 +292,7 @@
       connection_secret: connectionSecret,
       endpoint,
       mapping_profile_endpoint: mappingProfileEndpoint,
+      import_boundary_endpoint: importBoundaryEndpoint,
       workspace_id: payload.workspaceId || payload.workspace_id || '',
       workspace_label: payload.workspaceLabel || payload.workspace_label || '',
       system_id: payload.systemId || payload.system_id || '',
@@ -303,9 +310,11 @@
     const connectionId = String(payload?.connectionId || payload?.connection_id || '').trim();
     const endpoint = String(payload?.endpoint || '').trim();
     const mappingProfileEndpoint = String(payload?.mappingProfileEndpoint || payload?.mapping_profile_endpoint || '').trim();
+    const importBoundaryEndpoint = String(payload?.importBoundaryEndpoint || payload?.import_boundary_endpoint || '').trim();
     if (payload?.provider !== 'roll20' || !connectionId) return null;
     if (endpoint && !isAllowedSnapshotEndpoint(endpoint)) return null;
     if (mappingProfileEndpoint && !isAllowedMappingProfileEndpoint(mappingProfileEndpoint)) return null;
+    if (importBoundaryEndpoint && !isAllowedImportBoundaryEndpoint(importBoundaryEndpoint)) return null;
 
     return enrichConnectionScope({
       provider: 'roll20',
@@ -313,6 +322,7 @@
       connection_id: connectionId,
       endpoint,
       mapping_profile_endpoint: mappingProfileEndpoint,
+      import_boundary_endpoint: importBoundaryEndpoint,
       workspace_id: payload.workspaceId || payload.workspace_id || '',
       workspace_label: payload.workspaceLabel || payload.workspace_label || '',
       system_id: payload.systemId || payload.system_id || '',
@@ -333,6 +343,7 @@
       ...existingConnection,
       endpoint: contextPatch.endpoint || existingConnection.endpoint,
       mapping_profile_endpoint: contextPatch.mapping_profile_endpoint || existingConnection.mapping_profile_endpoint || '',
+      import_boundary_endpoint: contextPatch.import_boundary_endpoint || existingConnection.import_boundary_endpoint || '',
       workspace_id: contextPatch.workspace_id || existingConnection.workspace_id || '',
       workspace_label: contextPatch.workspace_label || existingConnection.workspace_label || '',
       system_id: contextPatch.system_id || existingConnection.system_id || '',
@@ -423,6 +434,20 @@
     }
   }
 
+  function isAllowedImportBoundaryEndpoint(endpoint) {
+    try {
+      const url = new URL(String(endpoint || ''));
+      const host = url.hostname.toLowerCase();
+      const isLocal = host === 'localhost' || host === '127.0.0.1';
+      const isSupabase = host.endsWith('.supabase.co');
+      return ['http:', 'https:'].includes(url.protocol)
+        && (isLocal || isSupabase)
+        && url.pathname.includes('/functions/v1/get-vtt-import-boundary');
+    } catch (_error) {
+      return false;
+    }
+  }
+
   function isAllowedRollCodexConnectUrl(connectUrl) {
     try {
       const url = new URL(String(connectUrl || ''));
@@ -456,6 +481,15 @@
     const payload = request?.payload;
     return request?.type === 'rollcodex:roll20-bridge-mapping-profile'
       && isAllowedMappingProfileEndpoint(request.endpoint)
+      && payload?.provider === 'roll20'
+      && typeof payload.connection_id === 'string'
+      && typeof payload.connection_secret === 'string';
+  }
+
+  function isAllowedImportBoundaryRequest(request) {
+    const payload = request?.payload;
+    return request?.type === 'rollcodex:roll20-bridge-import-boundary'
+      && isAllowedImportBoundaryEndpoint(request.endpoint)
       && payload?.provider === 'roll20'
       && typeof payload.connection_id === 'string'
       && typeof payload.connection_secret === 'string';
@@ -576,6 +610,33 @@
     }
   }
 
+  async function fetchImportBoundaryFromRollCodex(request, sendResponse) {
+    if (!isAllowedImportBoundaryRequest(request)) {
+      sendResponse({ ok: false, error: 'Borne d import refusee par le bridge.' });
+      return;
+    }
+
+    try {
+      const response = await fetch(request.endpoint, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'text/plain;charset=UTF-8',
+          'X-RollCodex-Client': BRIDGE_CLIENT,
+        },
+        body: JSON.stringify(request.payload),
+      });
+      const text = await response.text();
+      const payload = parseJsonText(text);
+      if (!response.ok) {
+        sendResponse({ ok: false, error: payload?.message || payload?.error || 'Borne RollCodex refusee.' });
+        return;
+      }
+      sendResponse({ ok: true, payload });
+    } catch (error) {
+      sendResponse({ ok: false, error: error?.message || 'Borne RollCodex inaccessible.' });
+    }
+  }
+
   function openRollCodexConnectPage(url, sendResponse) {
     if (!isAllowedRollCodexConnectUrl(url)) {
       sendResponse({ ok: false, error: 'URL de jumelage RollCodex refusee.' });
@@ -606,6 +667,10 @@
     }
     if (message?.type === MESSAGE_FETCH_MAPPING_PROFILE) {
       fetchMappingProfileFromRollCodex(message.request, sendResponse);
+      return true;
+    }
+    if (message?.type === MESSAGE_FETCH_IMPORT_BOUNDARY) {
+      fetchImportBoundaryFromRollCodex(message.request, sendResponse);
       return true;
     }
     return false;

@@ -2,13 +2,14 @@
   const MESSAGE_SEND_CHAT_COMMAND = 'ROLLCODEX_ROLL20_SEND_CHAT_COMMAND';
   const MESSAGE_SEND_SNAPSHOT = 'ROLLCODEX_ROLL20_SEND_SNAPSHOT';
   const MESSAGE_FETCH_MAPPING_PROFILE = 'ROLLCODEX_ROLL20_FETCH_MAPPING_PROFILE';
+  const MESSAGE_FETCH_IMPORT_BOUNDARY = 'ROLLCODEX_ROLL20_FETCH_IMPORT_BOUNDARY';
   const MESSAGE_EXTENSION_CONNECTED = 'ROLLCODEX_ROLL20_EXTENSION_CONNECTED';
   const MESSAGE_OPEN_CONNECT_PAGE = 'ROLLCODEX_ROLL20_OPEN_CONNECT_PAGE';
   const CONFIRM_PREFIX = '!rollcodex confirm ';
   const BRIDGE_COMMAND_PREFIX = '!rollcodex bridge ';
   const BRIDGE_SNAPSHOT_MARKER = 'ROLLCODEX_BRIDGE_SNAPSHOT:';
   const BRIDGE_SNAPSHOT_TYPE = 'rollcodex:roll20-bridge-snapshot';
-  const BRIDGE_VERSION = '0.4.6';
+  const BRIDGE_VERSION = '0.4.7';
   const ROLLCODEX_APP_BASE_URL = 'http://localhost:5173';
   const ROLLCODEX_CONNECT_PATH = '/vtt/connect/roll20';
   const PENDING_PAIRING_KEY = 'rollcodexExtensionPendingPairing';
@@ -739,14 +740,23 @@
     );
   }
 
-  function getOwnSpeakingAsPlayerOption() {
+  function findOwnSpeakingAsPlayerOption(allowGmLabel) {
     const options = document.querySelectorAll('#speakingas option');
     for (const opt of options) {
       if (!String(opt.value || '').startsWith('player|')) continue;
       const label = normalizeText(opt.textContent);
-      if (label && !isGmSpeakerLabel(label)) return opt;
+      if (!label) continue;
+      if (!allowGmLabel && isGmSpeakerLabel(label)) continue;
+      return opt;
     }
     return null;
+  }
+
+  function getOwnSpeakingAsPlayerOption() {
+    // Variante filtrant le label MJ : utilisee cote lecteur pour "parler en tant
+    // que" soi-meme lors d'une requete de broadcast, sans jamais selectionner une
+    // identite MJ.
+    return findOwnSpeakingAsPlayerOption(false);
   }
 
   function getOwnSpeakingAsLabel() {
@@ -756,7 +766,10 @@
     // le plus stable pour distinguer MJ et joueur sans dependre du chat ni des
     // tuiles video (dont le textContent inclut le label "Rejoindre le chat audio
     // et video" qui pollue la lecture).
-    return normalizeText(getOwnSpeakingAsPlayerOption()?.textContent);
+    // On lit l'option BRUTE (suffixe (GM)/(MJ) conserve) : c'est precisement ce
+    // suffixe qui confirme le mode MJ. Filtrer le label MJ ici rendrait la
+    // detection MJ impossible et bloquerait l'envoi ("Mode MJ non confirme").
+    return normalizeText(findOwnSpeakingAsPlayerOption(true)?.textContent);
   }
 
   function setSpeakingAsOption(option) {
@@ -828,7 +841,27 @@
   }
 
   function isCurrentUserRoll20Gm() {
-    return getCurrentRoll20ModeInfo().mode === 'gm';
+    const modeInfo = getCurrentRoll20ModeInfo();
+    return modeInfo.mode === 'gm' && modeInfo.confidence !== 'fallback';
+  }
+
+  function getGmSnapshotBlockReason() {
+    const modeInfo = getCurrentRoll20ModeInfo();
+    if (modeInfo.mode === 'viewer') {
+      return {
+        modeInfo,
+        reason: 'viewer_mode',
+        status: 'Mode lecteur: seul le MJ envoie',
+      };
+    }
+    if (modeInfo.confidence === 'fallback') {
+      return {
+        modeInfo,
+        reason: 'gm_unconfirmed',
+        status: 'Mode MJ non confirme',
+      };
+    }
+    return null;
   }
 
   function getCurrentRoll20ModeInfo() {
@@ -934,12 +967,24 @@
     return role?.role === 'human' || isKnownHumanSpeakerLabel(label);
   }
 
+  function shouldKeepSpeakerDistinct(profile, speaker) {
+    // Decide si un speaker reste un intervenant distinct ou fusionne sur GM :
+    //   - MJ / "to GM" / nom du MJ -> GM ;
+    //   - profil 'human' ou joueur Roll20 connecte -> distinct ;
+    //   - profil 'npc'/force_gm ou heuristique PNJ/monstre -> GM ;
+    //   - sinon (personnage nomme incarne par le MJ, ex. impersonation) -> distinct,
+    //     pour rester associable a un joueur/personnage a l'import.
+    const label = normalizeSpeakerLabel(speaker);
+    if (!label || isSpeakerRoutedToGm(label)) return false;
+    if (shouldKeepSpeakerAsHuman(profile, label)) return true;
+    if (shouldRouteSpeakerToGm(profile, label) || isNpcOrMonsterSpeakerLabel(label)) return false;
+    return true;
+  }
+
   function routeDetectedSpeaker(profile, speaker) {
     const label = normalizeSpeakerLabel(speaker);
-    if (!label || isGmSpeakerLabel(label) || /to\s*gm/i.test(label)) return getCurrentGmName();
-    if (shouldKeepSpeakerAsHuman(profile, label)) return label;
-    if (shouldRouteSpeakerToGm(profile, label) || isNpcOrMonsterSpeakerLabel(label)) return getCurrentGmName();
-    return getCurrentGmName();
+    if (!label) return getCurrentGmName();
+    return shouldKeepSpeakerDistinct(profile, label) ? label : getCurrentGmName();
   }
 
   function getChatSender(node) {
@@ -2367,6 +2412,7 @@
             <button type="button" data-rollcodex-end-session title="Fin de session" style="${panelButtonStyle('purple')}" ${connection ? '' : 'disabled'}>Fin</button>
             <button type="button" data-rollcodex-forget title="Oublier la connexion" style="${panelButtonStyle('secondary')}">Oub.</button>
           </div>
+          <button type="button" data-rollcodex-resync title="Renvoyer depuis le dernier import RollCodex (sans retoucher les sessions deja mappees)" style="${panelButtonStyle('brown')};margin-top:4px;width:100%;font-size:10px" ${connection ? '' : 'disabled'}>Resync RollCodex</button>
           <div style="display:flex;align-items:center;gap:4px;margin-top:5px;color:${PANEL_COLORS.muted};font-size:10px">
             <button type="button" data-rollcodex-auto-minus title="Reduire l'intervalle auto" style="${panelButtonStyle('secondary')};min-height:19px;min-width:22px;padding:1px 5px">-</button>
             <span data-rollcodex-auto-minutes>Auto ${Math.round((autoSettings.idleMs || DEFAULT_AUTO_IDLE_MS) / 60000)} min</span>
@@ -2380,6 +2426,7 @@
     panel.querySelector('[data-rollcodex-toggle-panel]')?.addEventListener('click', togglePanelCollapsed);
     panel.querySelector('[data-rollcodex-connect]')?.addEventListener('click', startExtensionPairing);
     panel.querySelector('[data-rollcodex-chat-send]')?.addEventListener('click', sendExtensionSnapshot);
+    panel.querySelector('[data-rollcodex-resync]')?.addEventListener('click', resyncFromServerBoundary);
     panel.querySelector('[data-rollcodex-end-session]')?.addEventListener('click', endExtensionSession);
     panel.querySelector('[data-rollcodex-auto]')?.addEventListener('click', toggleAutoCapture);
     panel.querySelector('[data-rollcodex-auto-minus]')?.addEventListener('click', () => adjustAutoIdle(-5));
@@ -2688,15 +2735,13 @@
     if (shouldCarryPreviousSpeaker && lastResolvedChatSpeaker) {
       speaker = lastResolvedChatSpeaker;
     }
-    // Regle :
-    //   1) profil RollCodex le marque 'human' (character avec player_id) -> PJ ;
-    //   2) sinon, s'il apparait dans la liste Roll20 des joueurs connectes hors MJ -> PJ aussi
-    //      (le MJ a juste oublie de le creer dans RollCodex) ;
-    //   3) sinon, on assume MJ -> bucket GM.
-    const routedRole = getProfileSpeakerRole(mappingProfile, speaker);
-    const isProfileHuman = routedRole?.role === 'human';
-    const isConnectedRoll20Player = !isSpeakerRoutedToGm(speaker) && isKnownHumanSpeakerLabel(speaker);
-    if (!isProfileHuman && !isConnectedRoll20Player) {
+    // Filet de securite (notamment pour les speakers issus du seul texte, non
+    // routes par getChatSpeaker) : meme doctrine que shouldKeepSpeakerDistinct.
+    //   1) profil 'human' ou joueur Roll20 connecte -> PJ distinct ;
+    //   2) personnage nomme non-PNJ incarne par le MJ -> intervenant distinct,
+    //      mappable a l'import ;
+    //   3) sinon (MJ, PNJ/monstre, inconnu) -> bucket GM.
+    if (!shouldKeepSpeakerDistinct(mappingProfile, speaker)) {
       speaker = gmName;
     }
     if (!speaker || speaker === 'Roll20') {
@@ -2804,16 +2849,26 @@
   }
 
   // Déduplication GM/To GM et fusion des messages identiques (priorité GM)
-  async function collectExtensionMessages(connectionOverride = null) {
-    const lastSentKey = await getFirstScopedStorageValue(LAST_SENT_KEY);
+  async function collectExtensionMessages(connectionOverride = null, options = {}) {
+    // Par defaut on slice sur le marqueur local (envoi incrementiel). Le renvoi borne
+    // passe une `boundaryKey` explicite (dernier message importe cote RollCodex).
+    const boundaryKey = Object.prototype.hasOwnProperty.call(options, 'boundaryKey')
+      ? options.boundaryKey
+      : await getFirstScopedStorageValue(LAST_SENT_KEY);
     const connection = connectionOverride || await getCurrentConnection();
     const profile = connection ? await getMappingProfile(connection).catch(() => currentMappingProfile) : currentMappingProfile;
     const messages = getChatRows().map((node, index) => normalizeChatRow(node, index, profile)).filter(Boolean);
     const deduped = dedupeNormalizedMessages(messages);
-    const pending = getPendingMessagesSlice(deduped, lastSentKey);
+    const pending = getPendingMessagesSlice(deduped, boundaryKey);
     // L'affichage live reste base sur les messages visibles, pas uniquement les pending.
     // Cela évite le reset du panneau après un envoi auto (onglet caché, changement de fenêtre).
     rebuildLiveMetricsFromMessages(deduped);
+    if (options.returnMeta) {
+      // anchorFound : la borne existe-t-elle dans le chat visible ? Sinon getPendingMessagesSlice
+      // renverrait TOUT le chat (garde anti-sur-envoi cote renvoi borne).
+      const anchorFound = !boundaryKey || deduped.some((message) => message.key === boundaryKey);
+      return { pending, deduped, anchorFound, boundaryKey };
+    }
     return pending;
   }
 
@@ -2973,6 +3028,38 @@
     return profile;
   }
 
+  function deriveImportBoundaryEndpoint(connection) {
+    // Compat connexions appairees avant l'ajout de import_boundary_endpoint :
+    // on reconstruit l'URL a partir de celle du mapping profile (meme host/path base).
+    const mapping = normalizeText(connection?.mapping_profile_endpoint);
+    if (!mapping.includes('/functions/v1/vtt-mapping-profile')) return '';
+    return mapping.replace('/functions/v1/vtt-mapping-profile', '/functions/v1/get-vtt-import-boundary');
+  }
+
+  // Borne "server-authoritative" : dernier message_id deja importe cote RollCodex.
+  // Retourne `undefined` si la requete echoue/impossible, `null` si aucun import
+  // n'existe (renvoi complet autorise), sinon { message_id, run_id, batch_status, ... }.
+  async function getImportBoundary(connection) {
+    const endpoint = connection?.import_boundary_endpoint || deriveImportBoundaryEndpoint(connection);
+    if (!endpoint || !connection?.connection_id || !connection?.connection_secret) return undefined;
+
+    const response = await sendRuntimeMessage({
+      type: MESSAGE_FETCH_IMPORT_BOUNDARY,
+      request: {
+        type: 'rollcodex:roll20-bridge-import-boundary',
+        endpoint,
+        payload: {
+          provider: 'roll20',
+          connection_id: connection.connection_id,
+          connection_secret: connection.connection_secret,
+        },
+      },
+    });
+
+    if (!response?.ok) return undefined;
+    return response.payload?.boundary ?? null;
+  }
+
   function buildMappingHintsFromProfile(profile, messages) {
     const mappings = Array.isArray(profile?.mappings) ? profile.mappings : [];
     const mappingsBySpeaker = new Map();
@@ -3055,6 +3142,13 @@
     const silent = Boolean(options.silent);
     if (mode === 'auto' && autoCaptureInFlight) return;
     if (mode === 'auto') autoCaptureInFlight = true;
+    const snapshotBlock = getGmSnapshotBlockReason();
+    if (snapshotBlock) {
+      if (snapshotBlock.modeInfo.mode === 'viewer') reevaluateRuntimeMode('snapshot_guard');
+      if (!silent) updatePanelStatus(snapshotBlock.status);
+      if (mode === 'auto') autoCaptureInFlight = false;
+      return;
+    }
     const connection = await getCurrentConnection();
     if (!connection?.endpoint) {
       if (!silent) updatePanelStatus('Connexion RollCodex manquante');
@@ -3098,6 +3192,63 @@
       refreshPanel();
   }
 
+  // Renvoi borne : on demande a RollCodex la borne (dernier message importe) et on
+  // renvoie uniquement ce qui suit, sans toucher aux sessions deja mappees ni dependre
+  // du marqueur local. Si l'import d'hier a ete supprime cote RollCodex, la borne recule
+  // et hier repart corrige.
+  async function resyncFromServerBoundary() {
+    const snapshotBlock = getGmSnapshotBlockReason();
+    if (snapshotBlock) {
+      if (snapshotBlock.modeInfo.mode === 'viewer') reevaluateRuntimeMode('resync_guard');
+      updatePanelStatus(snapshotBlock.status);
+      return;
+    }
+    const connection = await getCurrentConnection();
+    if (!connection?.endpoint) {
+      updatePanelStatus('Connexion RollCodex manquante');
+      return;
+    }
+    updatePanelStatus('Lecture de la borne RollCodex...');
+    const boundary = await getImportBoundary(connection);
+    if (boundary === undefined) {
+      updatePanelStatus('Borne RollCodex inaccessible');
+      return;
+    }
+    // boundary === null : aucun import existant -> renvoi complet autorise.
+    // boundary present mais message_id absent : impossible de localiser la fin -> abort.
+    if (boundary && boundary.message_id == null) {
+      updatePanelStatus('Borne RollCodex indeterminee: renvoi annule');
+      return;
+    }
+    const boundaryKey = boundary?.message_id || null;
+    const { pending, anchorFound } = await collectExtensionMessages(connection, { boundaryKey, returnMeta: true });
+    if (boundaryKey && !anchorFound) {
+      updatePanelStatus('Ancre introuvable: deroule l historique de chat');
+      return;
+    }
+    if (!pending.length) {
+      updatePanelStatus('Rien a renvoyer depuis le dernier import');
+      return;
+    }
+    updatePanelStatus(`Renvoi de ${pending.length} messages...`);
+    const request = {
+      type: BRIDGE_SNAPSHOT_TYPE,
+      ack_token: buildUuid(),
+      endpoint: connection.endpoint,
+      payload: await buildExtensionSnapshotPayload(connection, pending, { mode: 'manual', reason: 'roll20_resync_boundary' }),
+    };
+    const response = await sendRuntimeMessage({ type: MESSAGE_SEND_SNAPSHOT, request });
+    if (!response?.ok) {
+      updatePanelStatus(response?.error || 'Renvoi refuse');
+      return;
+    }
+    const refreshedProfile = await getMappingProfile(connection, { force: true }).catch(() => null);
+    await setStorageValues({ [getLastSentStorageKey()]: pending[pending.length - 1].key });
+    broadcastViewerSession(connection, refreshedProfile, 'resync_boundary');
+    updatePanelStatus(`Renvoi effectue (${pending.length} messages)`);
+    refreshPanel();
+  }
+
   async function getPendingMessagesCount() {
     return (await collectExtensionMessages()).length;
   }
@@ -3110,6 +3261,14 @@
       skipIfEmpty: true,
     });
     refreshPanel(pending ? `Fin de session envoyee (${pending} messages)` : 'Fin de session sans nouveau message');
+  }
+
+  async function clearLocalGmConnectionArtifactsForViewer() {
+    await Promise.all(getScopedStorageKeys(CONNECTION_KEY).map((key) => removeStorageValue(key).catch(() => null)));
+    await Promise.all(getScopedStorageKeys(PENDING_PAIRING_KEY).map((key) => removeStorageValue(key).catch(() => null)));
+    await Promise.all(getScopedStorageKeys(LAST_SENT_KEY).map((key) => removeStorageValue(key).catch(() => null)));
+    await Promise.all(getScopedStorageKeys(MAPPING_PROFILE_KEY).map((key) => removeStorageValue(key).catch(() => null)));
+    resetLiveMetricsState();
   }
 
   async function forgetExtensionConnection() {
@@ -3734,9 +3893,15 @@
       return false;
     }
     if (message?.type === MESSAGE_EXTENSION_CONNECTED) {
-      if (currentRuntimeMode === 'viewer') {
+      const connectionBlock = getGmSnapshotBlockReason();
+      if (connectionBlock) {
+        if (connectionBlock.modeInfo.mode === 'viewer') {
+          reevaluateRuntimeMode('connection_guard');
+          clearLocalGmConnectionArtifactsForViewer().catch(() => null);
+        }
         // Le mode lecteur ne stocke pas de connexion locale : tout vient du broadcast MJ.
-        sendResponse({ ok: false, ignored: true, reason: 'viewer_mode' });
+        // Le fallback GM est aussi bloque pour eviter qu'un onglet joueur capture une vue partielle.
+        sendResponse({ ok: false, ignored: true, reason: connectionBlock.reason });
         return true;
       }
       if (message.connection && !connectionMatchesCurrentTable(message.connection)) {
@@ -3788,6 +3953,7 @@
       stopGmLifecycleListeners();
       stopAutoCaptureObserver();
       stopBridgeSnapshotObserver();
+      clearLocalGmConnectionArtifactsForViewer().catch(() => null);
       if (viewerHeartbeatTimer) {
         window.clearInterval(viewerHeartbeatTimer);
         viewerHeartbeatTimer = null;
@@ -3831,6 +3997,7 @@
   window.addEventListener('focus', handleVisibilityModeRecheck);
 
   if (currentRuntimeMode === 'viewer') {
+    clearLocalGmConnectionArtifactsForViewer().catch(() => null);
     startViewerBroadcastObserver();
     startViewerChatObserver();
     window.setTimeout(async () => {
