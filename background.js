@@ -7,7 +7,7 @@
   const MESSAGE_SYNC_CONNECTION = 'ROLLCODEX_ROLL20_SYNC_CONNECTION';
   const MESSAGE_OPEN_CONNECT_PAGE = 'ROLLCODEX_ROLL20_OPEN_CONNECT_PAGE';
   const CONFIRM_PREFIX = '!rollcodex confirm ';
-  const BRIDGE_CLIENT = 'roll20-extension/0.4.8';
+  const BRIDGE_CLIENT = 'roll20-extension/0.4.9';
   const PENDING_PAIRING_KEY = 'rollcodexExtensionPendingPairing';
   const CONNECTION_KEY = 'rollcodexExtensionConnection';
 

@@ -9,7 +9,7 @@
   const BRIDGE_COMMAND_PREFIX = '!rollcodex bridge ';
   const BRIDGE_SNAPSHOT_MARKER = 'ROLLCODEX_BRIDGE_SNAPSHOT:';
   const BRIDGE_SNAPSHOT_TYPE = 'rollcodex:roll20-bridge-snapshot';
-  const BRIDGE_VERSION = '0.4.8';
+  const BRIDGE_VERSION = '0.4.9';
   const ROLLCODEX_APP_BASE_URL = 'http://localhost:5173';
   const ROLLCODEX_CONNECT_PATH = '/vtt/connect/roll20';
   const PENDING_PAIRING_KEY = 'rollcodexExtensionPendingPairing';
@@ -2500,7 +2500,7 @@
 
   function buildViewerLiveSummaryFromBroadcast(broadcast, selectedMetricId) {
     const summary = broadcast?.live_summary;
-    if (!summary || !Array.isArray(summary.metrics)) return null;
+    if (!summary || !Array.isArray(summary.metrics) || !summary.metrics.length) return null;
     const orderedMetrics = summary.metrics
       .slice()
       .sort((left, right) => (Number(left.sort_order) || 0) - (Number(right.sort_order) || 0)
@@ -3600,11 +3600,11 @@
     // pour rester sous la limite. Le lecteur n'aura qu'une vue partielle mais
     // utilisable (les premieres entrees sont les plus pertinentes par sort_order).
     const trimAttempts = [
-      { metrics: 24, mappings: 48, speakerRoles: 48 },
-      { metrics: 12, mappings: 24, speakerRoles: 24 },
-      { metrics: 6, mappings: 12, speakerRoles: 12 },
-      { metrics: 3, mappings: 6, speakerRoles: 6 },
-      { metrics: 0, mappings: 0, speakerRoles: 0 },
+      { metrics: 24, mappings: 48, speakerRoles: 48, leaderboard: 12 },
+      { metrics: 12, mappings: 24, speakerRoles: 24, leaderboard: 8 },
+      { metrics: 6, mappings: 12, speakerRoles: 12, leaderboard: 6 },
+      { metrics: 3, mappings: 6, speakerRoles: 6, leaderboard: 4 },
+      { metrics: 1, mappings: 0, speakerRoles: 0, leaderboard: 2 },
     ];
 
     for (const attempt of trimAttempts) {
@@ -3615,11 +3615,14 @@
         mappings: (payload.profile.mappings || []).slice(0, attempt.mappings),
         speaker_roles: (payload.profile.speaker_roles || []).slice(0, attempt.speakerRoles),
       } : null;
-      // On garde le classement precalcule en priorite (c'est ce que le lecteur affiche) :
-      // on borne le nombre de mesures mais on conserve leur leaderboard complet.
+      // Garder au moins une mesure lisible avant de sacrifier tout le resume.
+      // Les classements sont aussi bornes car ils dominent vite la taille du whisper.
       const trimmedLiveSummary = payload.live_summary ? {
         totals: payload.live_summary.totals,
-        metrics: (payload.live_summary.metrics || []).slice(0, attempt.metrics),
+        metrics: (payload.live_summary.metrics || []).slice(0, attempt.metrics).map((metric) => ({
+          ...metric,
+          leaderboard: (metric.leaderboard || []).slice(0, attempt.leaderboard),
+        })),
       } : null;
       const trimmed = { ...payload, profile: trimmedProfile, live_summary: trimmedLiveSummary, truncated: true };
       const trimmedMarker = buildMarker(trimmed);
